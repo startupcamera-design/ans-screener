@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ANS Screener – Supertrend Saham BEI
 
 Next.js 14 (App Router) + TypeScript + Tailwind + Supabase. Screener saham BEI berbasis Supertrend
@@ -79,3 +80,6 @@ tests/                                               `npm test`
 - Emiten yang tidak ikut file terakhir ditandai data lama dan disembunyikan secara default; tidak diberi skor.
 - Keamanan: secret key hanya dipakai di route handler server dan penulisan data diverifikasi terhadap `ADMIN_EMAIL`.
 - Alat bantu analisis teknikal, bukan rekomendasi investasi.
+=======
+# ans-screener
+>>>>>>> eab0b634213a0800670894e800aba41b0b3b5d4b
