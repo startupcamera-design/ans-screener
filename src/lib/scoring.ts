@@ -17,7 +17,7 @@ export type ScoreResult = {
   parts: ScorePart[];
 };
 
-const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
+const clamp01 = (x: number) => (Number.isFinite(x) ? Math.min(1, Math.max(0, x)) : 0);
 const ramp = (x: number, a: number, b: number) => clamp01((x - a) / (b - a));
 const f = (v: number | null, d = 2) => (v === null ? "–" : v.toFixed(d));
 
@@ -25,7 +25,7 @@ const f = (v: number | null, d = 2) => (v === null ? "–" : v.toFixed(d));
 export function scoreMetrics(m: Metrics, rs: number | null, minValue: number = MIN_AVG_VALUE): ScoreResult {
   const parts: ScorePart[] = [];
   const add = (key: keyof typeof WEIGHTS, label: string, fraction: number, detail: string) =>
-    parts.push({ key, label, weight: WEIGHTS[key], fraction: clamp01(fraction), detail });
+    parts.push({ key, label, weight: WEIGHTS[key] ?? 0, fraction: clamp01(fraction), detail });
 
   // 1) Kedekatan ke garis: 0 di <=0.2 ATR, penuh 0.5-2 ATR, turun ke 0 di 4 ATR
   const d = m.distAtr;
@@ -36,7 +36,7 @@ export function scoreMetrics(m: Metrics, rs: number | null, minValue: number = M
     `${f(d)} ATR di atas garis`
   );
 
-  // 2) Risk/reward: penuh di R:R >= 3
+  // 2) Risk/reward (bobot 0, tetap dihitung untuk laporan IC backtest)
   add("rr", "Risk/reward", m.rr === null ? 0 : ramp(m.rr, 0, 3), `R:R ${f(m.rr)} (target high 20 hari)`);
 
   // 3) Kualitas tren
@@ -56,12 +56,14 @@ export function scoreMetrics(m: Metrics, rs: number | null, minValue: number = M
   const age = m.barsInTrend;
   add("trendAge", "Umur tren", age < 2 ? 0.2 : age < 5 ? 0.6 : age <= 40 ? 1 : 0.6, `${age} bar sejak BUY`);
 
-  // 5) Kedalaman koreksi: ideal 20-60% dari rentang 20 hari
+  // 5) Kedalaman koreksi (REVISI BERDASARKAN BACKTEST):
+  // Saham yang bertahan dekat puncak (retrace <= 15%) menghasilkan +4.70%, jauh lebih tinggi
+  // dibanding yang koreksi dalam (0.34%). Skor penuh jika retrace <= 0.15, turun ke 0 di 0.50.
   const r = m.retrace;
   add(
     "pullback",
     "Kedalaman koreksi",
-    r === null ? 0 : r < 0.2 ? ramp(r, 0, 0.2) : r <= 0.6 ? 1 : 1 - ramp(r, 0.6, 1),
+    r === null ? 0 : 1 - ramp(r, 0.15, 0.5),
     `${r === null ? "–" : (r * 100).toFixed(0) + "%"} dari rentang 20 hari`
   );
 
@@ -73,7 +75,7 @@ export function scoreMetrics(m: Metrics, rs: number | null, minValue: number = M
     `volume 5 hari = ${f(m.volRatio)}x rata-rata 20 hari`
   );
 
-  // 7) Pola candle bullish (bar terakhir 1.0, kemarin 0.6, 2 hari lalu 0.3); kurang berharga jauh dari garis
+  // 7) Pola candle bullish (bobot 0, tetap dihitung untuk laporan IC backtest)
   const recency = m.patternAge === null ? 0 : [1, 0.6, 0.3][m.patternAge] ?? 0;
   const near = m.distAtr !== null && m.distAtr <= 2.5 ? 1 : 0.4;
   add(
@@ -91,7 +93,9 @@ export function scoreMetrics(m: Metrics, rs: number | null, minValue: number = M
     rs === null ? "belum diketahui" : `peringkat ${(rs * 100).toFixed(0)} persentil (return ~3 bulan ${m.ret60 === null ? "–" : (m.ret60 * 100).toFixed(1) + "%"})`
   );
 
-  const total = Math.round(parts.reduce((s, p) => s + p.weight * p.fraction, 0));
+  const totalWeight = parts.reduce((s, p) => s + p.weight, 0);
+  const rawScore = parts.reduce((s, p) => s + p.weight * p.fraction, 0);
+  const total = totalWeight > 0 ? Math.round((rawScore / totalWeight) * 100) : 0;
 
   let reason: string | null = null;
   if (m.trend !== 1) reason = "Tren bearish";

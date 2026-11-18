@@ -60,7 +60,7 @@ const STORE_KEY = "ans-screener-v2";
 const SORT_KEYS: SortKey[] = ["ticker", "score", "close", "change_pct", "avgValue", "trend", "distAtr", "rr", "days_since_flip"];
 
 const SORTS: { id: string; label: string; key: SortKey; dir: 1 | -1 }[] = [
-  { id: "score", label: "Skor tertinggi", key: "score", dir: -1 },
+  { id: "score", label: "Skor setup tertinggi", key: "score", dir: -1 },
   { id: "dist", label: "Paling dekat ke garis", key: "distAtr", dir: 1 },
   { id: "rr", label: "Risk/reward terbaik", key: "rr", dir: -1 },
   { id: "up", label: "Naik terbesar", key: "change_pct", dir: -1 },
@@ -71,7 +71,7 @@ const SORTS: { id: string; label: string; key: SortKey; dir: 1 | -1 }[] = [
 
 const PRESETS: { id: Preset; label: string; hint: string }[] = [
   { id: "all", label: "Semua", hint: "Semua emiten sesuai filter di bawah." },
-  { id: "pullback", label: "Pullback ke garis", hint: "Bullish, jaraknya ke garis Supertrend ≤ 2 ATR, dan tren sudah berjalan ≥ 3 bar. Kandidat koreksi sehat." },
+  { id: "pullback", label: "Pullback ke garis", hint: "Bullish, jaraknya ke garis Supertrend ≤ 2 ATR, dan tren sudah berjalan ≥ 3 bar. Harga dekat garis, sehingga stop-nya pendek." },
   { id: "newbuy", label: "Sinyal BUY baru", hint: "Supertrend baru berbalik menjadi bullish pada bar terakhir." },
   { id: "pattern", label: "Pola candle bullish", hint: "Bullish dan ada pola candle bullish (Hammer, Engulfing, dll.) dalam 3 bar terakhir." },
 ];
@@ -319,7 +319,7 @@ export default function Screener() {
 
       {summary.noMetrics > 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
-          {summary.noMetrics} emiten belum punya skor. Jalankan upload dengan “Rebuild riwayat” agar terhitung.
+          {summary.noMetrics} emiten belum punya skor setup. Jalankan upload dengan “Rebuild riwayat” agar terhitung.
         </div>
       )}
 
@@ -442,7 +442,7 @@ export default function Screener() {
           <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
             <tr>
               <Th k="ticker" label="Ticker" sort={sort} onSort={toggleSort} />
-              <Th k="score" label="Skor" sort={sort} onSort={toggleSort} tip="Skor 0–100 untuk saham bullish yang likuid" />
+              <Th k="score" label="Skor setup" sort={sort} onSort={toggleSort} tip="Kelengkapan kriteria setup (0–100). Belum terbukti memprediksi return." />
               <Th k="close" label="Harga" right sort={sort} onSort={toggleSort} />
               <Th k="change_pct" label="Chg %" right sort={sort} onSort={toggleSort} />
               <Th k="trend" label="Status" sort={sort} onSort={toggleSort} />
@@ -542,7 +542,7 @@ function FilterPanel({ f, setF, staleCount }: { f: Filters; setF: (p: Partial<Fi
         <Field label="Status tren">
           <Segmented value={f.trend} onChange={(v) => setF({ trend: v as TrendFilter })} options={[["bull", "Bullish"], ["bear", "Bearish"], ["all", "Semua"]]} />
         </Field>
-        <Field label="Skor minimal (0–100)">
+        <Field label="Skor setup minimal (0–100)">
           <input value={f.minScore} onChange={(e) => setF({ minScore: e.target.value })} inputMode="numeric" placeholder="mis. 60" className={inputCls} />
         </Field>
         <Field label="Jarak maks ke garis (ATR)" hint="1 ATR ≈ gerak harian rata-rata">
