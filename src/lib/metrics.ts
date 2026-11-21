@@ -19,6 +19,8 @@ export type Metrics = {
   atrPct: number; // ATR / close * 100
   pattern: string | null; // pola candle bullish terbaru (<= 2 bar lalu)
   patternAge: number | null; // 0 = bar terakhir
+  stLine: number | null; // harga garis Supertrend (garis SL)
+  slRiskPct: number | null; // % jarak dari close ke garis SL (negatif saat bullish, mis. -4.5)
 };
 
 const avg = (a: number[]) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
@@ -104,6 +106,10 @@ export function computeMetrics(bars: VBar[], st: STPoint[], end = bars.length - 
   const base = Math.max(0, end - 8);
   const recent = pats.filter((x) => base + x.index >= end - 2).pop();
 
+  const atrPct = b.close > 0 ? (p.atr / b.close) * 100 : 0;
+  const stLine = bullish ? p.up : p.dn;
+  const slRiskPct = bullish && b.close > 0 ? ((p.up - b.close) / b.close) * 100 : null;
+
   return {
     trend: p.trend,
     distAtr,
@@ -116,9 +122,11 @@ export function computeMetrics(bars: VBar[], st: STPoint[], end = bars.length - 
     volRatio: vol20 > 0 ? vol5 / vol20 : null,
     ret60: end >= 60 && bars[end - 60].close > 0 ? b.close / bars[end - 60].close - 1 : null,
     avgValue20: avg(w20.map((x) => x.close * x.volume)),
-    atrPct: (p.atr / b.close) * 100,
+    atrPct,
     pattern: recent ? recent.name : null,
     patternAge: recent ? end - (base + recent.index) : null,
+    stLine,
+    slRiskPct,
   };
 }
 
@@ -126,9 +134,28 @@ export function computeMetrics(bars: VBar[], st: STPoint[], end = bars.length - 
 export function metricsFromDb(d: any): Metrics | null {
   if (!d || d.avg_value20 === null || d.avg_value20 === undefined) return null;
   const n = (v: any) => (v === null || v === undefined ? null : Number(v));
+
+  const trend = Number(d.trend) as 1 | -1;
+  const close = Number(d.close ?? 0);
+  const distAtr = n(d.dist_atr);
+  const atrPct = Number(d.atr_pct ?? 0);
+
+  // Hitung ulang harga garis Supertrend & risiko SL (%) dari distAtr dan atrPct
+  let stLine: number | null = n(d.supertrend ?? d.st_line ?? d.stop_line);
+  let slRiskPct: number | null = null;
+
+  if (trend === 1 && distAtr !== null && atrPct > 0 && close > 0) {
+    slRiskPct = -(distAtr * atrPct);
+    if (stLine === null) {
+      stLine = close * (1 + slRiskPct / 100);
+    }
+  } else if (stLine !== null && close > 0 && trend === 1) {
+    slRiskPct = ((stLine - close) / close) * 100;
+  }
+
   return {
-    trend: Number(d.trend) as 1 | -1,
-    distAtr: n(d.dist_atr),
+    trend,
+    distAtr,
     rr: n(d.rr),
     barsInTrend: Number(d.bars_in_trend ?? 0),
     adx: n(d.adx),
@@ -138,8 +165,10 @@ export function metricsFromDb(d: any): Metrics | null {
     volRatio: n(d.vol_ratio),
     ret60: n(d.ret60),
     avgValue20: Number(d.avg_value20),
-    atrPct: Number(d.atr_pct ?? 0),
+    atrPct,
     pattern: d.pattern ?? null,
     patternAge: n(d.pattern_age),
+    stLine,
+    slRiskPct,
   };
 }

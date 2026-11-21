@@ -21,16 +21,16 @@ type Row = {
   stale: boolean;
   score: number | null; // null = tidak lolos filter / tanpa metrik
   distAtr: number | null;
-  rr: number | null;
-  pattern: string | null;
-  patternAge: number | null;
+  stLine: number | null;
+  slRiskPct: number | null;
+  rsPct: number | null;
   barsInTrend: number | null;
   avgValue: number | null;
   hasMetrics: boolean;
 };
 
-type SortKey = "ticker" | "score" | "close" | "change_pct" | "avgValue" | "trend" | "distAtr" | "rr" | "days_since_flip";
-type Preset = "all" | "pullback" | "newbuy" | "pattern";
+type SortKey = "ticker" | "score" | "close" | "change_pct" | "avgValue" | "trend" | "distAtr" | "slRiskPct" | "days_since_flip";
+type Preset = "prime" | "all" | "pullback" | "newbuy";
 type TrendFilter = "all" | "bull" | "bear";
 type Filters = {
   preset: Preset;
@@ -42,10 +42,11 @@ type Filters = {
   minPrice: string;
   maxPrice: string;
   maxDist: string;
+  maxSlPct: string;
 };
 
 const DEFAULTS: Filters = {
-  preset: "all",
+  preset: "prime",
   trend: "bull",
   liquidOnly: true,
   hideNoVol: true,
@@ -54,15 +55,16 @@ const DEFAULTS: Filters = {
   minPrice: "",
   maxPrice: "",
   maxDist: "",
+  maxSlPct: "",
 };
 const DEFAULT_SORT: { key: SortKey; dir: 1 | -1 } = { key: "score", dir: -1 };
-const STORE_KEY = "ans-screener-v2";
-const SORT_KEYS: SortKey[] = ["ticker", "score", "close", "change_pct", "avgValue", "trend", "distAtr", "rr", "days_since_flip"];
+const STORE_KEY = "ans-screener-v3";
+const SORT_KEYS: SortKey[] = ["ticker", "score", "close", "change_pct", "avgValue", "trend", "distAtr", "slRiskPct", "days_since_flip"];
 
 const SORTS: { id: string; label: string; key: SortKey; dir: 1 | -1 }[] = [
   { id: "score", label: "Skor setup tertinggi", key: "score", dir: -1 },
+  { id: "sl", label: "Risiko SL terkecil", key: "slRiskPct", dir: -1 },
   { id: "dist", label: "Paling dekat ke garis", key: "distAtr", dir: 1 },
-  { id: "rr", label: "Risk/reward terbaik", key: "rr", dir: -1 },
   { id: "up", label: "Naik terbesar", key: "change_pct", dir: -1 },
   { id: "down", label: "Turun terbesar", key: "change_pct", dir: 1 },
   { id: "value", label: "Nilai transaksi terbesar", key: "avgValue", dir: -1 },
@@ -70,24 +72,37 @@ const SORTS: { id: string; label: string; key: SortKey; dir: 1 | -1 }[] = [
 ];
 
 const PRESETS: { id: Preset; label: string; hint: string }[] = [
+  {
+    id: "prime",
+    label: "Top Pick (≥ 86)",
+    hint: "Kuintil teratas hasil backtest (skor ≥ 86), bullish, likuid, dan jarak ke garis SL ≤ 8%. Kandidat utama untuk swing 10–20 hari bursa.",
+  },
   { id: "all", label: "Semua", hint: "Semua emiten sesuai filter di bawah." },
-  { id: "pullback", label: "Pullback ke garis", hint: "Bullish, jaraknya ke garis Supertrend ≤ 2 ATR, dan tren sudah berjalan ≥ 3 bar. Harga dekat garis, sehingga stop-nya pendek." },
-  { id: "newbuy", label: "Sinyal BUY baru", hint: "Supertrend baru berbalik menjadi bullish pada bar terakhir." },
-  { id: "pattern", label: "Pola candle bullish", hint: "Bullish dan ada pola candle bullish (Hammer, Engulfing, dll.) dalam 3 bar terakhir." },
+  {
+    id: "pullback",
+    label: "Dekat garis SL",
+    hint: "Bullish, jarak ke garis Supertrend ≤ 2 ATR, dan tren sudah berjalan ≥ 5 bar (terkonfirmasi). Risiko stop loss pendek.",
+  },
+  {
+    id: "newbuy",
+    label: "Sinyal BUY baru",
+    hint: "Supertrend baru berbalik menjadi bullish pada bar terakhir (hati-hati false breakout; ideal tunggu ≥ 5 bar).",
+  },
 ];
 
 const PAGE_SIZE = 40;
 const idNum = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 2 });
+const idPrice = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 0 });
 const idCompact = new Intl.NumberFormat("id-ID", { notation: "compact", maximumFractionDigits: 1 });
 
 const matchPreset = (r: Row, p: Preset) =>
   p === "all"
     ? true
+    : p === "prime"
+    ? r.trend === 1 && (r.score ?? 0) >= 86 && (r.slRiskPct === null || r.slRiskPct >= -8)
     : p === "pullback"
-    ? r.trend === 1 && r.distAtr !== null && r.distAtr <= 2 && (r.barsInTrend ?? 0) >= 3
-    : p === "newbuy"
-    ? r.signal === "BUY"
-    : r.trend === 1 && !!r.pattern;
+    ? r.trend === 1 && r.distAtr !== null && r.distAtr <= 2 && (r.barsInTrend ?? 0) >= 5
+    : r.signal === "BUY";
 
 const parseNum = (s: string) => {
   const t = s.trim();
@@ -168,7 +183,8 @@ export default function Screener() {
           data.map((d, i) => {
             const m: Metrics | null = metrics[i];
             const stale = d.date < latest;
-            const res = m && !stale ? scoreMetrics(m, pm.get(d.ticker) ?? null) : null;
+            const rsVal = pm.get(d.ticker);
+            const res = m && !stale ? scoreMetrics(m, rsVal ?? null) : null;
             return {
               ticker: d.ticker,
               date: d.date,
@@ -181,9 +197,9 @@ export default function Screener() {
               stale,
               score: res && res.eligible ? res.total : null,
               distAtr: m?.distAtr ?? null,
-              rr: m?.rr ?? null,
-              pattern: m?.pattern ?? null,
-              patternAge: m?.patternAge ?? null,
+              stLine: m?.stLine ?? null,
+              slRiskPct: m?.slRiskPct ?? null,
+              rsPct: rsVal !== undefined ? Math.round(rsVal * 100) : null,
               barsInTrend: m?.barsInTrend ?? null,
               avgValue: m?.avgValue20 ?? null,
               hasMetrics: !!m,
@@ -215,7 +231,11 @@ export default function Screener() {
 
   /* ---- penyaringan ---- */
   const base = useMemo(() => {
-    const pMin = parseNum(f.minPrice), pMax = parseNum(f.maxPrice), dMax = parseNum(f.maxDist), sMin = parseNum(f.minScore);
+    const pMin = parseNum(f.minPrice),
+      pMax = parseNum(f.maxPrice),
+      dMax = parseNum(f.maxDist),
+      sMin = parseNum(f.minScore),
+      slMax = parseNum(f.maxSlPct);
     const needle = q.trim().toUpperCase();
     return rows.filter((r) => {
       if (needle && !r.ticker.includes(needle)) return false;
@@ -228,6 +248,7 @@ export default function Screener() {
       if (pMax !== null && r.close > pMax) return false;
       if (dMax !== null && (r.distAtr === null || r.distAtr > dMax)) return false;
       if (sMin !== null && (r.score === null || r.score < sMin)) return false;
+      if (slMax !== null && (r.slRiskPct === null || Math.abs(r.slRiskPct) > slMax)) return false;
       return true;
     });
   }, [rows, q, f]);
@@ -262,7 +283,7 @@ export default function Screener() {
   };
 
   const activeCount = (
-    ["trend", "liquidOnly", "hideNoVol", "hideStale", "minScore", "minPrice", "maxPrice", "maxDist"] as (keyof Filters)[]
+    ["trend", "liquidOnly", "hideNoVol", "hideStale", "minScore", "minPrice", "maxPrice", "maxDist", "maxSlPct"] as (keyof Filters)[]
   ).filter((k) => f[k] !== DEFAULTS[k]).length;
   const reset = () => {
     setFState(DEFAULTS);
@@ -424,14 +445,14 @@ export default function Screener() {
       </div>
 
       <details className="group rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm">
-        <summary className="cursor-pointer select-none font-medium text-slate-700">Cara membaca skor dan kolom</summary>
+        <summary className="cursor-pointer select-none font-medium text-slate-700">Panduan eksekusi EOD & cara membaca kolom</summary>
         <dl className="mt-3 grid gap-x-8 gap-y-2.5 text-slate-600 md:grid-cols-2">
-          <Def t="Skor (0–100)">Penilaian peluang swing 1 minggu–1 bulan untuk saham bullish yang likuid. Makin tinggi makin ideal; klik saham untuk melihat rincian per faktor. Bobotnya masih awal, belum teruji backtest.</Def>
-          <Def t="Jarak (ATR)">Jarak harga ke garis Supertrend dalam satuan ATR (rata-rata pergerakan harian). 0,5–2 ATR berarti harga dekat garis; garis itu juga menjadi acuan stop-loss.</Def>
-          <Def t="R:R">Risk/reward: potensi naik ke harga tertinggi 20 hari dibanding risiko turun ke garis. Di atas 2 umumnya dianggap menarik.</Def>
-          <Def t="Sinyal">“BUY baru” = Supertrend baru berbalik bullish hari ini. Selain itu menunjukkan berapa hari lalu sinyal terakhir terjadi.</Def>
-          <Def t="Pola">Pola candle bullish dalam 3 bar terakhir (Hammer, Engulfing, Piercing, Harami, Morning Star, Three White Soldiers).</Def>
-          <Def t="Nilai/hari">Rata-rata nilai transaksi 20 hari (harga × volume). Saham di bawah batas Rp {idNum.format(MIN_AVG_VALUE)} disembunyikan agar tidak sulit ditransaksikan.</Def>
+          <Def t="Skor (0–100)">Teruji backtest untuk swing 10–20 hari bursa. Fokus utama pada kuintil teratas (Skor ≥ 86) dan urutkan dari skor tertinggi.</Def>
+          <Def t="Garis SL & Risiko SL">Harga garis Supertrend ATR {ST_PERIOD} (mult {ST_MULT}) sebagai acuan SL otomatis di sekuritas (pasang 1–2 tick di bawahnya). Hindari masuk jika risiko SL lebih dalam dari -8%.</Def>
+          <Def t="Aturan Beli EOD">Pasang limit order beli maks +1,5% di atas harga close kemarin. Jika dibuka gap up terlalu tinggi, lewati kandidat tersebut.</Def>
+          <Def t="Usia Tren (Bar)">Tren paling optimal di rentang 5–40 bar sejak sinyal BUY. Sinyal 1–4 bar masih rawan false breakout.</Def>
+          <Def t="RS % (Kekuatan Relatif)">Peringkat performa 3 bulan terakhir dibanding seluruh saham bursa (0–100%). Makin tinggi berarti pemimpin pasar.</Def>
+          <Def t="Nilai/hari">Rata-rata nilai transaksi 20 hari (minimal Rp {idNum.format(MIN_AVG_VALUE)}/hari) agar likuid dan mudah dieksekusi.</Def>
         </dl>
         <p className="mt-3 text-xs text-slate-500">Alat bantu analisis teknikal, bukan rekomendasi investasi.</p>
       </details>
@@ -442,14 +463,14 @@ export default function Screener() {
           <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
             <tr>
               <Th k="ticker" label="Ticker" sort={sort} onSort={toggleSort} />
-              <Th k="score" label="Skor setup" sort={sort} onSort={toggleSort} tip="Kelengkapan kriteria setup (0–100). Belum terbukti memprediksi return." />
+              <Th k="score" label="Skor setup" sort={sort} onSort={toggleSort} tip="Kuintil teratas ≥ 86 teruji unggul pada backtest" />
               <Th k="close" label="Harga" right sort={sort} onSort={toggleSort} />
               <Th k="change_pct" label="Chg %" right sort={sort} onSort={toggleSort} />
-              <Th k="trend" label="Status" sort={sort} onSort={toggleSort} />
-              <Th k="days_since_flip" label="Sinyal" sort={sort} onSort={toggleSort} tip="Kapan Supertrend terakhir berbalik arah" />
-              <Th k="distAtr" label="Jarak (ATR)" right sort={sort} onSort={toggleSort} tip="Jarak harga ke garis Supertrend dalam satuan ATR" />
-              <Th k="rr" label="R:R" right sort={sort} onSort={toggleSort} tip="Risk/reward ke high 20 hari dengan stop di garis" />
-              <th className="px-3 py-2.5 text-left font-medium">Pola</th>
+              <Th k="days_since_flip" label="Usia tren" sort={sort} onSort={toggleSort} tip="Ideal pada 5–40 bar sejak sinyal BUY" />
+              <Th k="distAtr" label="Jarak (ATR)" right sort={sort} onSort={toggleSort} tip="Jarak harga ke garis Supertrend dalam satuan ATR (ideal 0.5–2.0)" />
+              <th className="px-3 py-2.5 text-right font-medium" title="Harga garis Supertrend (acuan stop loss otomatis)">Garis SL</th>
+              <Th k="slRiskPct" label="Risiko SL" right sort={sort} onSort={toggleSort} tip="Persentase rugi dari close jika kena garis SL (maksimal ideal -8%)" />
+              <th className="px-3 py-2.5 text-right font-medium" title="Peringkat kekuatan relatif 60 bar (0–100)">RS</th>
               <Th k="avgValue" label="Nilai/hari" right sort={sort} onSort={toggleSort} tip="Rata-rata nilai transaksi 20 hari" />
             </tr>
           </thead>
@@ -468,11 +489,25 @@ export default function Screener() {
                 <td className="px-3 py-2.5"><ScoreBadge score={r.score} /></td>
                 <td className="px-3 py-2.5 text-right tabular-nums">{idNum.format(r.close)}</td>
                 <td className={`px-3 py-2.5 text-right tabular-nums ${chgCls(r.change_pct)}`}>{fmtPct(r.change_pct, true)}</td>
-                <td className="px-3 py-2.5"><TrendBadge trend={r.trend} /></td>
                 <td className="px-3 py-2.5"><SignalCell r={r} /></td>
                 <td className="px-3 py-2.5 text-right tabular-nums">{r.distAtr === null ? "–" : r.distAtr.toFixed(2)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{r.rr === null ? "–" : r.rr.toFixed(1)}</td>
-                <td className="px-3 py-2.5 text-xs text-amber-700">{r.trend === 1 && r.pattern ? r.pattern : ""}</td>
+                <td className="px-3 py-2.5 text-right font-medium tabular-nums text-slate-700">
+                  {r.stLine === null ? "–" : idPrice.format(r.stLine)}
+                </td>
+                <td
+                  className={`px-3 py-2.5 text-right font-medium tabular-nums ${
+                    r.slRiskPct === null
+                      ? "text-slate-400"
+                      : r.slRiskPct < -8
+                      ? "text-rose-600"
+                      : "text-emerald-700"
+                  }`}
+                >
+                  {r.slRiskPct === null ? "–" : `${r.slRiskPct.toFixed(1)}%`}
+                </td>
+                <td className="px-3 py-2.5 text-right text-xs tabular-nums text-slate-600">
+                  {r.rsPct === null ? "–" : `${r.rsPct}%`}
+                </td>
                 <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{r.avgValue === null ? "–" : idCompact.format(r.avgValue)}</td>
               </tr>
             ))}
@@ -492,6 +527,11 @@ export default function Screener() {
               <div className="flex items-center gap-2">
                 <span className="text-base font-bold">{r.ticker.replace(/\.JK$/, "")}</span>
                 <TrendBadge trend={r.trend} />
+                {r.rsPct !== null && (
+                  <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">
+                    RS {r.rsPct}%
+                  </span>
+                )}
                 {r.stale && <span className="text-[10px] text-slate-400">({fmtDate(r.date)})</span>}
               </div>
               <div className="mt-1 flex items-baseline gap-2">
@@ -500,14 +540,18 @@ export default function Screener() {
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
                 <SignalCell r={r} />
+                {r.stLine !== null && (
+                  <span>
+                    SL <b className="tabular-nums text-slate-700">{idPrice.format(r.stLine)}</b>{" "}
+                    {r.slRiskPct !== null && (
+                      <b className={`tabular-nums ${r.slRiskPct < -8 ? "text-rose-600" : "text-emerald-700"}`}>
+                        ({r.slRiskPct.toFixed(1)}%)
+                      </b>
+                    )}
+                  </span>
+                )}
                 <span>Jarak <b className="tabular-nums text-slate-700">{r.distAtr === null ? "–" : r.distAtr.toFixed(1)}</b> ATR</span>
-                <span>R:R <b className="tabular-nums text-slate-700">{r.rr === null ? "–" : r.rr.toFixed(1)}</b></span>
               </div>
-              {r.trend === 1 && r.pattern && (
-                <div className="mt-1.5 inline-block rounded bg-amber-50 px-1.5 py-0.5 text-xs font-medium text-amber-700">
-                  {r.pattern}{r.patternAge === 0 ? " · hari ini" : r.patternAge ? ` · ${r.patternAge} hari lalu` : ""}
-                </div>
-              )}
             </div>
             <ScoreCircle score={r.score} />
           </button>
@@ -517,7 +561,7 @@ export default function Screener() {
       {filtered.length === 0 && (
         <div className="rounded-2xl border border-dashed border-slate-300 bg-white py-12 text-center">
           <p className="font-medium text-slate-700">Tidak ada emiten yang cocok</p>
-          <p className="mt-1 text-sm text-slate-500">Coba longgarkan filter atau pilih preset lain.</p>
+          <p className="mt-1 text-sm text-slate-500">Coba longgarkan filter atau pilih preset &ldquo;Semua&rdquo;.</p>
           <button onClick={reset} className="mt-4 rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white">Reset filter</button>
         </div>
       )}
@@ -538,14 +582,17 @@ export default function Screener() {
 function FilterPanel({ f, setF, staleCount }: { f: Filters; setF: (p: Partial<Filters>) => void; staleCount: number }) {
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-5">
         <Field label="Status tren">
           <Segmented value={f.trend} onChange={(v) => setF({ trend: v as TrendFilter })} options={[["bull", "Bullish"], ["bear", "Bearish"], ["all", "Semua"]]} />
         </Field>
-        <Field label="Skor setup minimal (0–100)">
-          <input value={f.minScore} onChange={(e) => setF({ minScore: e.target.value })} inputMode="numeric" placeholder="mis. 60" className={inputCls} />
+        <Field label="Skor setup minimal">
+          <input value={f.minScore} onChange={(e) => setF({ minScore: e.target.value })} inputMode="numeric" placeholder="mis. 86" className={inputCls} />
         </Field>
-        <Field label="Jarak maks ke garis (ATR)" hint="1 ATR ≈ gerak harian rata-rata">
+        <Field label="Risiko SL maks (%)" hint="Jarak dari close ke garis SL">
+          <input value={f.maxSlPct} onChange={(e) => setF({ maxSlPct: e.target.value })} inputMode="decimal" placeholder="mis. 8" className={inputCls} />
+        </Field>
+        <Field label="Jarak maks (ATR)" hint="1 ATR ≈ gerak harian">
           <input value={f.maxDist} onChange={(e) => setF({ maxDist: e.target.value })} inputMode="decimal" placeholder="mis. 2" className={inputCls} />
         </Field>
         <div className="grid grid-cols-2 gap-3">
@@ -677,8 +724,17 @@ function SignalCell({ r }: { r: Row }) {
       </span>
     );
   }
-  if (r.days_since_flip === null) return <span className="text-xs text-slate-400">–</span>;
-  return <span className="text-xs text-slate-500">sinyal {r.days_since_flip} hari lalu</span>;
+  const bars = r.barsInTrend ?? r.days_since_flip;
+  if (bars === null) return <span className="text-xs text-slate-400">–</span>;
+  const ideal = r.trend === 1 && bars >= 5 && bars <= 40;
+  const early = r.trend === 1 && bars < 5;
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs text-slate-600">
+      <span>{bars} bar</span>
+      {ideal && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">Ideal</span>}
+      {early && <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">Dini</span>}
+    </span>
+  );
 }
 
 function chgCls(v: number | null) {

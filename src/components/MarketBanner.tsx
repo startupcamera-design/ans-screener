@@ -35,7 +35,12 @@ export default function MarketBanner({ bull, total }: Props) {
         if (error) throw new Error(error.message);
         setBars(
           (data ?? []).reverse().map((d: any) => ({
-            date: d.date, open: +d.open, high: +d.high, low: +d.low, close: +d.close, volume: +d.volume,
+            date: d.date,
+            open: +d.open,
+            high: +d.high,
+            low: +d.low,
+            close: +d.close,
+            volume: +d.volume,
           }))
         );
       } catch (e: any) {
@@ -68,7 +73,7 @@ export default function MarketBanner({ bull, total }: Props) {
   }, [bars]);
 
   if (bars === null) {
-    return <div className="h-40 animate-pulse rounded-2xl border border-slate-200 bg-white" role="status" aria-label="Memuat IHSG" />;
+    return <div className="h-44 animate-pulse rounded-2xl border border-slate-200 bg-white" role="status" aria-label="Memuat IHSG" />;
   }
 
   if (!calc) {
@@ -88,6 +93,14 @@ export default function MarketBanner({ bull, total }: Props) {
 
   const bullish = calc.trend === 1;
   const breadth = total > 0 ? (bull / total) * 100 : null;
+
+  // Panduan porsi modal berdasarkan rezim IHSG & breadth pasar
+  const regimeAdvice =
+    bullish && (breadth === null || breadth >= 45)
+      ? "Rezim kondusif — siap alokasi penuh (4–5 slot) pada Top Pick (≥ 86)."
+      : bullish
+      ? "IHSG bullish tapi selektif — fokus hanya pada Top Pick (≥ 86) ber-RS tinggi."
+      : "Rezim IHSG bearish — kurangi agresi (maks 2–3 slot) pada Top Pick (≥ 86) dan patuhi SL otomatis.";
 
   return (
     <section
@@ -120,9 +133,9 @@ export default function MarketBanner({ bull, total }: Props) {
             {calc.signal && (
               <span className="ml-2 rounded bg-slate-900 px-2 py-1 text-xs font-bold text-white">{calc.signal} baru</span>
             )}
-            <p className="mt-2 hidden max-w-xs text-xs leading-relaxed text-slate-600 md:ml-auto md:block">
+            <p className="mt-2 hidden max-w-lg text-xs leading-relaxed text-slate-600 md:ml-auto md:block">
               {bullish ? "Di atas" : "Di bawah"} garis Supertrend{" "}
-              <span className="font-semibold tabular-nums">{num.format(calc.line)}</span> ({pct(calc.dist, true)}). Tren ini sudah berjalan{" "}
+              <span className="font-semibold tabular-nums">{num.format(calc.line)}</span> ({pct(calc.dist, true)}). Tren berjalan{" "}
               {calc.days} hari bursa.
             </p>
           </div>
@@ -132,8 +145,11 @@ export default function MarketBanner({ bull, total }: Props) {
           {bullish ? "Di atas" : "Di bawah"} garis Supertrend <span className="font-semibold tabular-nums">{num.format(calc.line)}</span> ({pct(calc.dist, true)}), tren {calc.days} hari bursa.
         </p>
 
-        <div className="mt-3 grid gap-3 md:mt-4 md:grid-cols-[1fr_280px] md:items-center md:gap-4">
-          <Spark st={calc.st} bars={bars} />
+        <div className="mt-3 grid gap-3 md:mt-4 md:grid-cols-[1fr_390px] md:items-center md:gap-5">
+          <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-2">
+            <CandleSpark st={calc.st} bars={bars} />
+          </div>
+
           <div>
             <div className="flex items-baseline justify-between text-xs">
               <span className="font-medium text-slate-600">Saham dengan tren bullish</span>
@@ -150,8 +166,13 @@ export default function MarketBanner({ bull, total }: Props) {
                 <> · {breadth >= 60 ? "pasar luas menguat" : breadth >= 40 ? "pasar campuran" : "pasar luas melemah"}</>
               )}
             </div>
-            <Link href={`/stock/${INDEX_TICKER}`} className="mt-3 inline-block text-xs font-medium text-emerald-700 hover:underline">
-              Lihat grafik IHSG →
+
+            <div className={`mt-2.5 rounded-lg px-2.5 py-1.5 text-[11px] leading-snug ${bullish ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"}`}>
+              {regimeAdvice}
+            </div>
+
+            <Link href={`/stock/${INDEX_TICKER}`} className="mt-2.5 inline-block text-xs font-medium text-emerald-700 hover:underline">
+              Lihat grafik lengkap IHSG →
             </Link>
           </div>
         </div>
@@ -160,32 +181,90 @@ export default function MarketBanner({ bull, total }: Props) {
   );
 }
 
-/** Grafik mini: penutupan 60 bar terakhir + garis Supertrend berwarna. */
-function Spark({ st, bars }: { st: ReturnType<typeof supertrend>; bars: VBar[] }) {
-  const N = Math.min(60, st.length);
+/** Grafik mini candlestick: 45 bar terakhir + garis Supertrend berwarna. */
+/** Grafik mini candlestick: 65 bar terakhir + garis Supertrend memenuhi penuh lebar kotak. */
+function CandleSpark({ st, bars }: { st: ReturnType<typeof supertrend>; bars: VBar[] }) {
+  const N = Math.min(65, st.length, bars.length);
   const pts = st.slice(-N);
-  const closes = bars.slice(-N).map((b) => b.close);
+  const sliceBars = bars.slice(-N);
   const lines = pts.map((p) => (p.trend === 1 ? p.up : p.dn));
-  const all = [...closes, ...lines];
-  const min = Math.min(...all), max = Math.max(...all);
+
+  const allValues = [
+    ...sliceBars.map((b) => b.high),
+    ...sliceBars.map((b) => b.low),
+    ...lines,
+  ];
+  const min = Math.min(...allValues);
+  const max = Math.max(...allValues);
   const span = max - min || 1;
-  const W = 300, H = 80, P = 4;
-  const x = (i: number) => P + (i / Math.max(1, N - 1)) * (W - 2 * P);
+
+  // Rasio lebar viewBox disesuaikan dengan kolom desktop (~700px) agar tidak menyisakan ruang kosong kiri-kanan
+  const W = 720;
+  const H = 115;
+  const P = 4;
+  const step = (W - 2 * P) / Math.max(1, N);
+  const candleW = Math.max(4, Math.min(8.5, step * 0.65));
+
+  const cx = (i: number) => P + step * i + step / 2;
   const y = (v: number) => H - P - ((v - min) / span) * (H - 2 * P);
 
-  const segs: { d: string; c: string }[] = [];
+  const stSegs: { d: string; c: string }[] = [];
   for (let i = 1; i < N; i++) {
     if (pts[i].trend !== pts[i - 1].trend) continue;
-    segs.push({ d: `M${x(i - 1).toFixed(1)},${y(lines[i - 1]).toFixed(1)}L${x(i).toFixed(1)},${y(lines[i]).toFixed(1)}`, c: pts[i].trend === 1 ? GREEN : RED });
+    stSegs.push({
+      d: `M${cx(i - 1).toFixed(1)},${y(lines[i - 1]).toFixed(1)}L${cx(i).toFixed(1)},${y(lines[i]).toFixed(1)}`,
+      c: pts[i].trend === 1 ? GREEN : RED,
+    });
   }
-  const close = closes.map((c, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(c).toFixed(1)}`).join("");
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="h-14 w-full md:h-20" role="img" aria-label="Grafik mini IHSG 60 hari dengan garis Supertrend">
-      <path d={close} fill="none" stroke="#64748b" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
-      {segs.map((s, i) => (
-        <path key={i} d={s.d} stroke={s.c} strokeWidth={2.5} fill="none" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      className="block h-24 w-full md:h-28"
+      role="img"
+      aria-label="Grafik candlestick IHSG 65 hari terakhir dengan garis Supertrend"
+    >
+      {/* Garis Supertrend */}
+      {stSegs.map((s, i) => (
+        <path key={`st-${i}`} d={s.d} stroke={s.c} strokeWidth={2} fill="none" strokeLinecap="round" />
       ))}
+
+      {/* Candlestick OHLC */}
+      {sliceBars.map((b, i) => {
+        const xCenter = cx(i);
+        const yHigh = y(b.high);
+        const yLow = y(b.low);
+        const yOpen = y(b.open);
+        const yClose = y(b.close);
+        const isUp = b.close >= b.open;
+        const color = isUp ? GREEN : RED;
+        const bodyTop = Math.min(yOpen, yClose);
+        const bodyHeight = Math.max(1.8, Math.abs(yClose - yOpen));
+
+        return (
+          <g key={b.date}>
+            {/* Sumbu High-Low */}
+            <line
+              x1={xCenter}
+              y1={yHigh}
+              x2={xCenter}
+              y2={yLow}
+              stroke={color}
+              strokeWidth={1.2}
+              opacity={0.85}
+            />
+            {/* Badan Open-Close */}
+            <rect
+              x={xCenter - candleW / 2}
+              y={bodyTop}
+              width={candleW}
+              height={bodyHeight}
+              rx={0.8}
+              fill={color}
+            />
+          </g>
+        );
+      })}
     </svg>
   );
 }
