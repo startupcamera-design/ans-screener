@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import Papa from "papaparse";
 import { supabaseBrowser } from "@/lib/supabase-browser";
+import { INDEX_TICKER } from "@/lib/config";
 import { checkHeaders, dedupe, PriceRow, validateRow } from "@/lib/csv";
 
 const CHUNK = 3000; // baris per request ke /api/upload
@@ -17,6 +19,7 @@ export default function UploadClient() {
   const [files, setFiles] = useState<File[]>([]);
   const [rebuild, setRebuild] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
   const [progress, setProgress] = useState(0);
   const [log, setLog] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
@@ -62,7 +65,7 @@ export default function UploadClient() {
       Papa.parse<Record<string, string>>(file, {
         header: true,
         skipEmptyLines: true,
-        transformHeader: (h) => h.replace(/^﻿/, "").trim(),
+        transformHeader: (h) => h.replace(/^\uFEFF/, "").trim(),
         complete: resolve,
         error: reject,
       });
@@ -72,9 +75,12 @@ export default function UploadClient() {
   async function run() {
     if (files.length === 0) return;
     setBusy(true);
+    setDone(false);
     setLog([]);
     setProgress(0);
     let totalSaved = 0;
+    let hasIndex = false;
+    let maxDate = "";
 
     try {
       // ---- 1) Parse + validasi + simpan, file demi file
@@ -93,8 +99,11 @@ export default function UploadClient() {
         const errSample: string[] = [];
         for (const rec of parsed.data) {
           const r = validateRow(rec);
-          if (r.status === "ok") ok.push(r.row);
-          else if (r.status === "skipped") skipped++;
+          if (r.status === "ok") {
+            ok.push(r.row);
+            if (r.row.ticker === INDEX_TICKER) hasIndex = true;
+            if (r.row.date > maxDate) maxDate = r.row.date;
+          } else if (r.status === "skipped") skipped++;
           else {
             errors++;
             if (errSample.length < 5) errSample.push(r.reason);
@@ -127,7 +136,11 @@ export default function UploadClient() {
         }
         setProgress(((fi + 1) / sorted.length) * 50);
       }
-      say(`✓ Tersimpan ${totalSaved} baris harga.`);
+
+      say(`✓ Tersimpan ${totalSaved} baris harga${maxDate ? ` (tanggal terbaru: ${maxDate})` : ""}.`);
+      if (!hasIndex) {
+        say(`! Catatan: Data ${INDEX_TICKER} (IHSG) tidak ditemukan di batch ini — pastikan ikut diunggah agar rezim pasar sinkron.`);
+      }
 
       // ---- 2) Hitung ulang Supertrend, bertahap
       say(`Menghitung Supertrend (${rebuild ? "rebuild riwayat 120 bar" : "15 bar terakhir"})…`);
@@ -137,11 +150,12 @@ export default function UploadClient() {
         const res: any = await post("/api/recompute", { offset, limit: 40, keep: rebuild ? 120 : 15 });
         insufficient += res.insufficient ?? 0;
         offset = res.nextOffset;
-        const done = offset === null ? res.total : offset;
-        setProgress(50 + (res.total ? (done / res.total) * 50 : 50));
+        const doneCount = offset === null ? res.total : offset;
+        setProgress(50 + (res.total ? (doneCount / res.total) * 50 : 50));
       }
       say(`✓ Selesai.${insufficient ? ` ${insufficient} ticker punya <10 bar sehingga belum dihitung.` : ""}`);
       setProgress(100);
+      setDone(true);
     } catch (e: any) {
       say(`✗ Gagal: ${e.message ?? e}`);
     } finally {
@@ -184,7 +198,10 @@ export default function UploadClient() {
           multiple
           disabled={busy}
           className="hidden"
-          onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
+          onChange={(e) => {
+            setFiles(Array.from(e.target.files ?? []));
+            setDone(false);
+          }}
         />
         <div className="text-slate-700">
           {files.length ? `${files.length} file dipilih` : "Klik untuk memilih file CSV (boleh banyak)"}
@@ -209,6 +226,26 @@ export default function UploadClient() {
       >
         {busy ? "Memproses…" : "Upload & hitung Supertrend"}
       </button>
+
+      {done && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+          <span className="font-medium">Data EOD siap dianalisis.</span>
+          <div className="flex flex-wrap gap-2">
+            <Link
+              href="/portfolio"
+              className="rounded-lg border border-emerald-300 bg-white px-3.5 py-1.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+            >
+              Cek Portofolio →
+            </Link>
+            <Link
+              href="/"
+              className="rounded-lg bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+            >
+              Buka Screener EOD →
+            </Link>
+          </div>
+        </div>
+      )}
 
       {(busy || log.length > 0) && (
         <div className="space-y-2">

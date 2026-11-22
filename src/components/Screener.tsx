@@ -6,6 +6,7 @@ import { fetchAll, supabaseBrowser } from "@/lib/supabase-browser";
 import { INDEX_TICKER, MIN_AVG_VALUE, ST_MULT, ST_PERIOD } from "@/lib/config";
 import { Metrics, metricsFromDb } from "@/lib/metrics";
 import { percentileMap, scoreMetrics } from "@/lib/scoring";
+import { floorToIdxTick } from "@/lib/portfolio-advisor";
 import MarketBanner from "./MarketBanner";
 import { scoreTone } from "./ScoreBreakdown";
 
@@ -19,9 +20,11 @@ type Row = {
   signal: "BUY" | "SELL" | null;
   days_since_flip: number | null;
   stale: boolean;
-  score: number | null; // null = tidak lolos filter / tanpa metrik
+  score: number | null;
   distAtr: number | null;
   stLine: number | null;
+  slTickPrice: number | null; // garis SL sudah dibulatkan 1 tick BEI ke bawah
+  maxBuyPrice: number; // batas limit beli +1.5% dibulatkan ke fraksi BEI
   slRiskPct: number | null;
   rsPct: number | null;
   barsInTrend: number | null;
@@ -115,6 +118,7 @@ export default function Screener() {
   const router = useRouter();
   const listTop = useRef<HTMLDivElement>(null);
   const [rows, setRows] = useState<Row[]>([]);
+  const [heldLots, setHeldLots] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -142,6 +146,7 @@ export default function Screener() {
     }
     setHydrated(true);
   }, []);
+
   useEffect(() => {
     if (!hydrated) return;
     try {
@@ -164,15 +169,26 @@ export default function Screener() {
     };
   }, [showFilters]);
 
-  /* ---- ambil data ---- */
+  /* ---- ambil data screener & posisi portofolio aktif ---- */
   useEffect(() => {
     (async () => {
       try {
         const db = supabaseBrowser();
-        const data = (
-          await fetchAll<any>((from, to) => db.from("screener_latest").select("*").order("ticker").range(from, to))
-        ).filter((d) => d.ticker !== INDEX_TICKER); // indeks tampil di banner, bukan di daftar saham
+        const [rawScreener, openPosRes] = await Promise.all([
+          fetchAll<any>((from, to) => db.from("screener_latest").select("*").range(from, to)),
+          db.from("portfolio_positions").select("ticker,lots").eq("status", "OPEN"),
+        ]);
 
+        // Map posisi aktif di portofolio (akumulasi lot jika ada beberapa entry)
+        const held: Record<string, number> = {};
+        if (!openPosRes.error && openPosRes.data) {
+          for (const p of openPosRes.data) {
+            held[p.ticker] = (held[p.ticker] ?? 0) + Number(p.lots);
+          }
+        }
+        setHeldLots(held);
+
+        const data = rawScreener.filter((d) => d.ticker !== INDEX_TICKER);
         const latest = data.reduce((mx, d) => (d.date > mx ? d.date : mx), "");
         const metrics = data.map((d) => metricsFromDb(d));
         const pm = percentileMap(
@@ -185,20 +201,32 @@ export default function Screener() {
             const stale = d.date < latest;
             const rsVal = pm.get(d.ticker);
             const res = m && !stale ? scoreMetrics(m, rsVal ?? null) : null;
+            const close = Number(d.close);
+            const trend = Number(d.trend) as 1 | -1;
+            const stLine = m?.stLine ?? (d.line !== null && d.line !== undefined ? Number(d.line) : null);
+            const slTickPrice = trend === 1 && stLine !== null ? floorToIdxTick(stLine, 1) : null;
+            const maxBuyPrice = floorToIdxTick(close * 1.015, 0);
+            const slRiskPct =
+              slTickPrice !== null && close > 0
+                ? ((slTickPrice - close) / close) * 100
+                : m?.slRiskPct ?? null;
+
             return {
               ticker: d.ticker,
               date: d.date,
-              close: Number(d.close),
+              close,
               volume: Number(d.volume),
               change_pct: d.change_pct === null ? null : Number(d.change_pct),
-              trend: Number(d.trend) as 1 | -1,
+              trend,
               signal: d.signal,
               days_since_flip: d.days_since_flip === null ? null : Number(d.days_since_flip),
               stale,
               score: res && res.eligible ? res.total : null,
               distAtr: m?.distAtr ?? null,
-              stLine: m?.stLine ?? null,
-              slRiskPct: m?.slRiskPct ?? null,
+              stLine,
+              slTickPrice,
+              maxBuyPrice,
+              slRiskPct,
               rsPct: rsVal !== undefined ? Math.round(rsVal * 100) : null,
               barsInTrend: m?.barsInTrend ?? null,
               avgValue: m?.avgValue20 ?? null,
@@ -215,6 +243,7 @@ export default function Screener() {
   }, []);
 
   const latestDate = useMemo(() => rows.reduce((mx, r) => (r.date > mx ? r.date : mx), ""), [rows]);
+  const heldCount = useMemo(() => Object.keys(heldLots).length, [heldLots]);
 
   const summary = useMemo(() => {
     const live = rows.filter((r) => !r.stale);
@@ -332,18 +361,24 @@ export default function Screener() {
             Data per {fmtDate(latestDate)} · Supertrend ATR {ST_PERIOD}, multiplier {ST_MULT.toFixed(1)} · {summary.live} emiten aktif
           </p>
         </div>
-<div className="flex items-center gap-4 text-xs text-slate-600">
-  <span><b className="text-emerald-600">{summary.buy}</b> BUY baru</span>
-  <span><b className="text-rose-600">{summary.sell}</b> SELL baru</span>
-  <a
-    href="/portfolio"
-    className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-semibold text-slate-800 hover:bg-slate-50"
-  >
-    Portofolio Saya →
-  </a>
-</div>
+        <div className="flex flex-wrap items-center gap-3 text-xs text-slate-600">
+          <span><b className="text-emerald-600">{summary.buy}</b> BUY baru</span>
+          <span><b className="text-rose-600">{summary.sell}</b> SELL baru</span>
+          <a
+            href="/portfolio"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-semibold text-slate-800 hover:bg-slate-50"
+          >
+            <span>Portofolio Saya</span>
+            {heldCount > 0 && (
+              <span className="rounded-full bg-emerald-600 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                {heldCount}
+              </span>
+            )}
+            <span>→</span>
+          </a>
+        </div>
       </div>
-      
+
       {summary.noMetrics > 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
           {summary.noMetrics} emiten belum punya skor setup. Jalankan upload dengan “Rebuild riwayat” agar terhitung.
@@ -454,9 +489,9 @@ export default function Screener() {
         <summary className="cursor-pointer select-none font-medium text-slate-700">Panduan eksekusi EOD & cara membaca kolom</summary>
         <dl className="mt-3 grid gap-x-8 gap-y-2.5 text-slate-600 md:grid-cols-2">
           <Def t="Skor (0–100)">Teruji backtest untuk swing 10–20 hari bursa. Fokus utama pada kuintil teratas (Skor ≥ 86) dan urutkan dari skor tertinggi.</Def>
-          <Def t="Garis SL & Risiko SL">Harga garis Supertrend ATR {ST_PERIOD} (mult {ST_MULT}) sebagai acuan SL otomatis di sekuritas (pasang 1–2 tick di bawahnya). Hindari masuk jika risiko SL lebih dalam dari -8%.</Def>
-          <Def t="Aturan Beli EOD">Pasang limit order beli maks +1,5% di atas harga close kemarin. Jika dibuka gap up terlalu tinggi, lewati kandidat tersebut.</Def>
-          <Def t="Usia Tren (Bar)">Tren paling optimal di rentang 5–40 bar sejak sinyal BUY. Sinyal 1–4 bar masih rawan false breakout.</Def>
+          <Def t="Order SL (Fraksi BEI)">Otomatis dibulatkan 1 tick BEI di bawah garis Supertrend ATR {ST_PERIOD} (mult {ST_MULT}) agar siap langsung dipasang di sekuritas. Hindari masuk jika risiko SL lebih dalam dari -8%.</Def>
+          <Def t="Batas Beli (+1,5%)">Harga limit order beli maksimal (sudah sesuai fraksi BEI). Jika harga pembukaan gap up di atas batas ini, lewati kandidat tersebut.</Def>
+          <Def t="Usia Tren (Bar)">Tren paling optimal di rentang 5–40 bar sejak sinyal BUY. Sinyal 1–4 bar masih rawan false breakout, sedangkan di atas 40 bar sudah matang.</Def>
           <Def t="RS % (Kekuatan Relatif)">Peringkat performa 3 bulan terakhir dibanding seluruh saham bursa (0–100%). Makin tinggi berarti pemimpin pasar.</Def>
           <Def t="Nilai/hari">Rata-rata nilai transaksi 20 hari (minimal Rp {idNum.format(MIN_AVG_VALUE)}/hari) agar likuid dan mudah dieksekusi.</Def>
         </dl>
@@ -469,99 +504,132 @@ export default function Screener() {
           <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
             <tr>
               <Th k="ticker" label="Ticker" sort={sort} onSort={toggleSort} />
-              <Th k="score" label="Skor setup" sort={sort} onSort={toggleSort} tip="Kuintil teratas ≥ 86 teruji unggul pada backtest" />
-              <Th k="close" label="Harga" right sort={sort} onSort={toggleSort} />
+              <Th k="score" label="Skor" sort={sort} onSort={toggleSort} tip="Kuintil teratas ≥ 86 teruji unggul pada backtest" />
+              <Th k="close" label="Close" right sort={sort} onSort={toggleSort} />
               <Th k="change_pct" label="Chg %" right sort={sort} onSort={toggleSort} />
+              <th className="px-3 py-2.5 text-right font-medium" title="Batas maksimal limit order beli (+1,5% dibulatkan ke fraksi BEI)">Beli Maks</th>
+              <th className="px-3 py-2.5 text-right font-medium" title="Harga auto-SL (1 tick BEI di bawah garis Supertrend)">Order SL</th>
+              <Th k="slRiskPct" label="Risiko SL" right sort={sort} onSort={toggleSort} tip="Persentase rugi dari close jika kena Order SL (maksimal ideal -8%)" />
               <Th k="days_since_flip" label="Usia tren" sort={sort} onSort={toggleSort} tip="Ideal pada 5–40 bar sejak sinyal BUY" />
-              <Th k="distAtr" label="Jarak (ATR)" right sort={sort} onSort={toggleSort} tip="Jarak harga ke garis Supertrend dalam satuan ATR (ideal 0.5–2.0)" />
-              <th className="px-3 py-2.5 text-right font-medium" title="Harga garis Supertrend (acuan stop loss otomatis)">Garis SL</th>
-              <Th k="slRiskPct" label="Risiko SL" right sort={sort} onSort={toggleSort} tip="Persentase rugi dari close jika kena garis SL (maksimal ideal -8%)" />
               <th className="px-3 py-2.5 text-right font-medium" title="Peringkat kekuatan relatif 60 bar (0–100)">RS</th>
               <Th k="avgValue" label="Nilai/hari" right sort={sort} onSort={toggleSort} tip="Rata-rata nilai transaksi 20 hari" />
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
-            {view.map((r) => (
-              <tr
-                key={r.ticker}
-                onClick={() => open(r.ticker)}
-                className={`cursor-pointer hover:bg-emerald-50/50 ${r.stale ? "text-slate-400" : ""}`}
-              >
-                <td className="px-3 py-2.5 font-semibold">
-                  {r.ticker.replace(/\.JK$/, "")}
-                  <span className="text-xs font-normal text-slate-400">.JK</span>
-                  {r.stale && <span className="ml-2 text-[10px] font-normal">({fmtDate(r.date)})</span>}
-                </td>
-                <td className="px-3 py-2.5"><ScoreBadge score={r.score} /></td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{idNum.format(r.close)}</td>
-                <td className={`px-3 py-2.5 text-right tabular-nums ${chgCls(r.change_pct)}`}>{fmtPct(r.change_pct, true)}</td>
-                <td className="px-3 py-2.5"><SignalCell r={r} /></td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{r.distAtr === null ? "–" : r.distAtr.toFixed(2)}</td>
-                <td className="px-3 py-2.5 text-right font-medium tabular-nums text-slate-700">
-                  {r.stLine === null ? "–" : idPrice.format(r.stLine)}
-                </td>
-                <td
-                  className={`px-3 py-2.5 text-right font-medium tabular-nums ${
-                    r.slRiskPct === null
-                      ? "text-slate-400"
-                      : r.slRiskPct < -8
-                      ? "text-rose-600"
-                      : "text-emerald-700"
+            {view.map((r) => {
+              const lots = heldLots[r.ticker];
+              return (
+                <tr
+                  key={r.ticker}
+                  onClick={() => open(r.ticker)}
+                  className={`cursor-pointer hover:bg-emerald-50/50 ${r.stale ? "text-slate-400" : ""} ${
+                    lots ? "bg-sky-50/35" : ""
                   }`}
                 >
-                  {r.slRiskPct === null ? "–" : `${r.slRiskPct.toFixed(1)}%`}
-                </td>
-                <td className="px-3 py-2.5 text-right text-xs tabular-nums text-slate-600">
-                  {r.rsPct === null ? "–" : `${r.rsPct}%`}
-                </td>
-                <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{r.avgValue === null ? "–" : idCompact.format(r.avgValue)}</td>
-              </tr>
-            ))}
+                  <td className="px-3 py-2.5 font-semibold">
+                    <div className="flex items-center gap-1.5">
+                      <span>
+                        {r.ticker.replace(/\.JK$/, "")}
+                        <span className="text-xs font-normal text-slate-400">.JK</span>
+                      </span>
+                      {lots && (
+                        <span
+                          title={`Saham ini sudah ada di Portofolio Saya (${lots} Lot)`}
+                          className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-bold text-sky-800"
+                        >
+                          Pegang {lots} Lot
+                        </span>
+                      )}
+                      {r.stale && <span className="text-[10px] font-normal">({fmtDate(r.date)})</span>}
+                    </div>
+                  </td>
+                  <td className="px-3 py-2.5"><ScoreBadge score={r.score} /></td>
+                  <td className="px-3 py-2.5 text-right tabular-nums">{idNum.format(r.close)}</td>
+                  <td className={`px-3 py-2.5 text-right tabular-nums ${chgCls(r.change_pct)}`}>{fmtPct(r.change_pct, true)}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-emerald-700">
+                    {r.trend === 1 ? idPrice.format(r.maxBuyPrice) : "–"}
+                  </td>
+                  <td className="px-3 py-2.5 text-right font-semibold tabular-nums text-rose-600">
+                    {r.slTickPrice === null ? "–" : idPrice.format(r.slTickPrice)}
+                  </td>
+                  <td
+                    className={`px-3 py-2.5 text-right font-medium tabular-nums ${
+                      r.slRiskPct === null
+                        ? "text-slate-400"
+                        : r.slRiskPct < -8
+                        ? "text-rose-600"
+                        : "text-emerald-700"
+                    }`}
+                  >
+                    {r.slRiskPct === null ? "–" : `${r.slRiskPct.toFixed(1)}%`}
+                  </td>
+                  <td className="px-3 py-2.5"><SignalCell r={r} /></td>
+                  <td className="px-3 py-2.5 text-right text-xs tabular-nums text-slate-600">
+                    {r.rsPct === null ? "–" : `${r.rsPct}%`}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{r.avgValue === null ? "–" : idCompact.format(r.avgValue)}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
 
       {/* ---- Kartu (mobile dan tablet) ---- */}
       <div className="grid gap-2.5 sm:grid-cols-2 lg:hidden">
-        {view.map((r) => (
-          <button
-            key={r.ticker}
-            onClick={() => open(r.ticker)}
-            className={`flex w-full items-stretch gap-3 rounded-2xl border border-slate-200 bg-white p-3.5 text-left active:bg-slate-50 ${r.stale ? "opacity-60" : ""}`}
-          >
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="text-base font-bold">{r.ticker.replace(/\.JK$/, "")}</span>
-                <TrendBadge trend={r.trend} />
-                {r.rsPct !== null && (
-                  <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">
-                    RS {r.rsPct}%
-                  </span>
-                )}
-                {r.stale && <span className="text-[10px] text-slate-400">({fmtDate(r.date)})</span>}
+        {view.map((r) => {
+          const lots = heldLots[r.ticker];
+          return (
+            <button
+              key={r.ticker}
+              onClick={() => open(r.ticker)}
+              className={`flex w-full items-stretch gap-3 rounded-2xl border p-3.5 text-left active:bg-slate-50 ${
+                lots ? "border-sky-200 bg-sky-50/30" : "border-slate-200 bg-white"
+              } ${r.stale ? "opacity-60" : ""}`}
+            >
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-base font-bold">{r.ticker.replace(/\.JK$/, "")}</span>
+                  <TrendBadge trend={r.trend} />
+                  {lots && (
+                    <span className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-bold text-sky-800">
+                      Pegang {lots}L
+                    </span>
+                  )}
+                  {r.rsPct !== null && (
+                    <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">
+                      RS {r.rsPct}%
+                    </span>
+                  )}
+                  {r.stale && <span className="text-[10px] text-slate-400">({fmtDate(r.date)})</span>}
+                </div>
+                <div className="mt-1 flex items-baseline gap-2">
+                  <span className="text-xl font-semibold tabular-nums">{idNum.format(r.close)}</span>
+                  <span className={`text-sm font-medium tabular-nums ${chgCls(r.change_pct)}`}>{fmtPct(r.change_pct, true)}</span>
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                  <SignalCell r={r} />
+                  {r.slTickPrice !== null && (
+                    <span>
+                      SL <b className="tabular-nums text-rose-600">{idPrice.format(r.slTickPrice)}</b>{" "}
+                      {r.slRiskPct !== null && (
+                        <b className={`tabular-nums ${r.slRiskPct < -8 ? "text-rose-600" : "text-emerald-700"}`}>
+                          ({r.slRiskPct.toFixed(1)}%)
+                        </b>
+                      )}
+                    </span>
+                  )}
+                  {r.trend === 1 && (
+                    <span>
+                      Beli ≤ <b className="tabular-nums text-emerald-700">{idPrice.format(r.maxBuyPrice)}</b>
+                    </span>
+                  )}
+                </div>
               </div>
-              <div className="mt-1 flex items-baseline gap-2">
-                <span className="text-xl font-semibold tabular-nums">{idNum.format(r.close)}</span>
-                <span className={`text-sm font-medium tabular-nums ${chgCls(r.change_pct)}`}>{fmtPct(r.change_pct, true)}</span>
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-                <SignalCell r={r} />
-                {r.stLine !== null && (
-                  <span>
-                    SL <b className="tabular-nums text-slate-700">{idPrice.format(r.stLine)}</b>{" "}
-                    {r.slRiskPct !== null && (
-                      <b className={`tabular-nums ${r.slRiskPct < -8 ? "text-rose-600" : "text-emerald-700"}`}>
-                        ({r.slRiskPct.toFixed(1)}%)
-                      </b>
-                    )}
-                  </span>
-                )}
-                <span>Jarak <b className="tabular-nums text-slate-700">{r.distAtr === null ? "–" : r.distAtr.toFixed(1)}</b> ATR</span>
-              </div>
-            </div>
-            <ScoreCircle score={r.score} />
-          </button>
-        ))}
+              <ScoreCircle score={r.score} />
+            </button>
+          );
+        })}
       </div>
 
       {filtered.length === 0 && (
@@ -595,7 +663,7 @@ function FilterPanel({ f, setF, staleCount }: { f: Filters; setF: (p: Partial<Fi
         <Field label="Skor setup minimal">
           <input value={f.minScore} onChange={(e) => setF({ minScore: e.target.value })} inputMode="numeric" placeholder="mis. 86" className={inputCls} />
         </Field>
-        <Field label="Risiko SL maks (%)" hint="Jarak dari close ke garis SL">
+        <Field label="Risiko SL maks (%)" hint="Jarak dari close ke Order SL">
           <input value={f.maxSlPct} onChange={(e) => setF({ maxSlPct: e.target.value })} inputMode="decimal" placeholder="mis. 8" className={inputCls} />
         </Field>
         <Field label="Jarak maks (ATR)" hint="1 ATR ≈ gerak harian">
@@ -734,11 +802,13 @@ function SignalCell({ r }: { r: Row }) {
   if (bars === null) return <span className="text-xs text-slate-400">–</span>;
   const ideal = r.trend === 1 && bars >= 5 && bars <= 40;
   const early = r.trend === 1 && bars < 5;
+  const mature = r.trend === 1 && bars > 40;
   return (
     <span className="inline-flex items-center gap-1.5 text-xs text-slate-600">
       <span>{bars} bar</span>
       {ideal && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">Ideal</span>}
       {early && <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">Dini</span>}
+      {mature && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">Tua</span>}
     </span>
   );
 }

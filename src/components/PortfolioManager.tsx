@@ -39,6 +39,9 @@ export default function PortfolioManager() {
   const [notes, setNotes] = useState("");
   const [saving, setSaving] = useState(false);
 
+  // Konfirmasi hapus inline (anti popup-blocker mobile)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
   // Modal tutup posisi (catat jual)
   const [closingPos, setClosingPos] = useState<EnrichedPosition | null>(null);
   const [sellDate, setSellDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -127,7 +130,7 @@ export default function PortfolioManager() {
   }, [positions, barsMap]);
 
   const closedList = useMemo(() => positions.filter((p) => p.status === "CLOSED"), [positions]);
-const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList]);
+  const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList]);
 
   const totals = useMemo(() => {
     let modal = 0;
@@ -144,6 +147,16 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
     return { modal, nilai, pnl, pnlPct, actionNeeded };
   }, [enrichedOpen]);
 
+  // Preview Realized P/L pada modal tutup posisi
+  const closePreview = useMemo(() => {
+    if (!closingPos) return null;
+    const sPrice = Number(sellPrice.replace(/\./g, "").replace(",", "."));
+    if (!Number.isFinite(sPrice) || sPrice <= 0) return null;
+    const pnlRp = (sPrice - closingPos.pos.buy_price) * closingPos.pos.lots * 100;
+    const pnlPct = ((sPrice - closingPos.pos.buy_price) / closingPos.pos.buy_price) * 100;
+    return { pnlRp, pnlPct };
+  }, [closingPos, sellPrice]);
+
   async function handleAddPosition(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
@@ -156,10 +169,15 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
       }
       const priceNum = Number(buyPrice.replace(/\./g, "").replace(",", "."));
       const lotsNum = parseInt(lots, 10);
-      const slNum = slInstalled.trim() ? Number(slInstalled.replace(/\./g, "").replace(",", ".")) : null;
+      const rawSlNum = slInstalled.trim() ? Number(slInstalled.replace(/\./g, "").replace(",", ".")) : null;
 
       if (!Number.isFinite(priceNum) || priceNum <= 0) throw new Error("Harga beli tidak valid.");
       if (!Number.isFinite(lotsNum) || lotsNum <= 0) throw new Error("Jumlah lot tidak valid.");
+      if (rawSlNum !== null && (!Number.isFinite(rawSlNum) || rawSlNum <= 0)) {
+        throw new Error("Harga SL terpasang tidak valid.");
+      }
+
+      const slNum = rawSlNum !== null ? floorToIdxTick(rawSlNum, 0) : null;
 
       const db = supabaseBrowser();
       const { error } = await db.from("portfolio_positions").insert({
@@ -205,9 +223,13 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
     e.preventDefault();
     if (!closingPos) return;
     setSaving(true);
+    setErr(null);
     try {
       const sPrice = Number(sellPrice.replace(/\./g, "").replace(",", "."));
       if (!Number.isFinite(sPrice) || sPrice <= 0) throw new Error("Harga jual tidak valid.");
+      if (sellDate < closingPos.pos.buy_date) {
+        throw new Error(`Tanggal jual tidak boleh lebih awal dari tanggal beli (${fmtDate(closingPos.pos.buy_date)}).`);
+      }
 
       const db = supabaseBrowser();
       const { error } = await db
@@ -231,10 +253,15 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
   }
 
   async function handleDelete(posId: string) {
-    if (!confirm("Hapus catatan posisi ini secara permanen?")) return;
-    const db = supabaseBrowser();
-    await db.from("portfolio_positions").delete().eq("id", posId);
-    await loadData();
+    try {
+      const db = supabaseBrowser();
+      const { error } = await db.from("portfolio_positions").delete().eq("id", posId);
+      if (error) throw new Error(error.message);
+      setConfirmDeleteId(null);
+      await loadData();
+    } catch (e: any) {
+      setErr(e.message ?? String(e));
+    }
   }
 
   return (
@@ -379,142 +406,144 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
           </div>
         </div>
       </div>
-{/* Panel Statistik Performa Nyata (Realized Win Rate, Expectancy & Penambahan Portofolio Bersih) */}
-<section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm md:p-5">
-  <div className="flex flex-wrap items-center justify-between gap-2">
-    <div>
-      <h2 className="text-sm font-bold text-slate-900">Statistik Perform (Realized)</h2>
-      <p className="text-xs text-slate-500">
-        Dihitung otomatis dari {perfStats.totalTrades} transaksi yang sudah selesai ditutup.
-      </p>
-    </div>
-    {perfStats.totalTrades > 0 && (
-      <span
-        className={`rounded-full px-3 py-1 text-xs font-bold ${
-          perfStats.expectancyPct > 0
-            ? "bg-emerald-100 text-emerald-800"
-            : "bg-rose-100 text-rose-800"
-        }`}
-      >
-        {perfStats.expectancyPct > 0
-          ? "Expectancy Positif · Strategi Menghasilkan"
-          : "Expectancy Negatif · Evaluasi Disiplin SL"}
-      </span>
-    )}
-  </div>
 
-  {perfStats.totalTrades === 0 ? (
-    <p className="mt-3 rounded-xl bg-slate-50 px-3.5 py-2.5 text-xs text-slate-500">
-      Belum ada transaksi yang ditutup (<i>CLOSED</i>). Setelah Anda menutup posisi pertama lewat tombol{" "}
-      <b>Catat Jual</b>, Win Rate, Expectancy, dan Penambahan Portofolio Bersih akan otomatis muncul di sini.
-    </p>
-  ) : (
-    <>
-      <div className="mt-3.5 grid grid-cols-2 gap-3 md:grid-cols-4">
-        {/* 1. Penambahan Portofolio Bersih */}
-        <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
-          <div className="text-[11px] font-medium text-slate-500">Penambahan Portofolio Bersih</div>
-          <div
-            className={`mt-1 text-base font-bold tabular-nums md:text-lg ${
-              perfStats.realizedNetRp > 0
-                ? "text-emerald-600"
-                : perfStats.realizedNetRp < 0
-                ? "text-rose-600"
-                : "text-slate-800"
-            }`}
-          >
-            {perfStats.realizedNetRp > 0 ? "+" : ""}
-            Rp {fmtInt.format(perfStats.realizedNetRp)}
+      {/* Panel Statistik Performa Nyata (Realized Win Rate, Expectancy & Penambahan Portofolio Bersih) */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-bold text-slate-900">Statistik Performa (Realized)</h2>
+            <p className="text-xs text-slate-500">
+              Dihitung otomatis dari {perfStats.totalTrades} transaksi yang sudah selesai ditutup.
+            </p>
           </div>
-          <div className="mt-0.5 text-[11px] text-slate-500">
-            Total bersih (Realized + Floating):{" "}
-            <b
-              className={
-                perfStats.realizedNetRp + totals.pnl >= 0 ? "text-emerald-700" : "text-rose-700"
-              }
+          {perfStats.totalTrades > 0 && (
+            <span
+              className={`rounded-full px-3 py-1 text-xs font-bold ${
+                perfStats.expectancyPct > 0
+                  ? "bg-emerald-100 text-emerald-800"
+                  : "bg-rose-100 text-rose-800"
+              }`}
             >
-              {perfStats.realizedNetRp + totals.pnl >= 0 ? "+" : ""}
-              Rp {fmtInt.format(perfStats.realizedNetRp + totals.pnl)}
-            </b>
-          </div>
-        </div>
-
-        {/* 2. Win Rate Aktual */}
-        <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
-          <div className="text-[11px] font-medium text-slate-500">Win Rate Aktual</div>
-          <div className="mt-1 text-base font-bold tabular-nums text-slate-900 md:text-lg">
-            {fmtDec.format(perfStats.winRatePct)}%
-          </div>
-          <div className="mt-0.5 text-[11px] text-slate-500">
-            <span className="font-semibold text-emerald-600">{perfStats.wins} Win</span> ·{" "}
-            <span className="font-semibold text-rose-600">{perfStats.losses} Loss</span> (dari{" "}
-            {perfStats.totalTrades} trade)
-          </div>
-        </div>
-
-        {/* 3. Expectancy per Transaksi */}
-        <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
-          <div className="text-[11px] font-medium text-slate-500">Expectancy / Transaksi</div>
-          <div
-            className={`mt-1 text-base font-bold tabular-nums md:text-lg ${
-              perfStats.expectancyPct >= 0 ? "text-emerald-600" : "text-rose-600"
-            }`}
-          >
-            {perfStats.expectancyPct >= 0 ? "+" : ""}
-            {fmtDec.format(perfStats.expectancyPct)}%
-          </div>
-          <div className="mt-0.5 text-[11px] tabular-nums text-slate-500">
-            Rata-rata{" "}
-            <b>
-              {perfStats.expectancyRp >= 0 ? "+" : ""}
-              Rp {fmtInt.format(perfStats.expectancyRp)}
-            </b>{" "}
-            / trade
-          </div>
-        </div>
-
-        {/* 4. Rasio Rata-rata Win vs Loss & Profit Factor */}
-        <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
-          <div className="text-[11px] font-medium text-slate-500">Avg Win vs Avg Loss</div>
-          <div className="mt-1 text-sm font-bold tabular-nums md:text-base">
-            <span className="text-emerald-600">+{fmtDec.format(perfStats.avgWinPct)}%</span>
-            <span className="mx-1 text-slate-400">/</span>
-            <span className="text-rose-600">-{fmtDec.format(perfStats.avgLossPct)}%</span>
-          </div>
-          <div className="mt-0.5 text-[11px] text-slate-500">
-            Profit Factor:{" "}
-            <b>{perfStats.profitFactor === null ? "∞" : fmtDec.format(perfStats.profitFactor)}</b> ·
-            Rata-rata {perfStats.avgHoldDays} hari
-          </div>
-        </div>
-      </div>
-
-      {/* Sorotan Trade Terbaik & Terburuk */}
-      {(perfStats.bestTrade || perfStats.worstTrade) && (
-        <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-1 border-t border-slate-100 pt-2.5 text-xs text-slate-600">
-          {perfStats.bestTrade && (
-            <span>
-              Trade terbaik:{" "}
-              <b className="text-emerald-700">
-                {perfStats.bestTrade.ticker} (+{fmtDec.format(perfStats.bestTrade.pnlPct)}% / +Rp{" "}
-                {fmtInt.format(perfStats.bestTrade.pnlRp)})
-              </b>
-            </span>
-          )}
-          {perfStats.worstTrade && perfStats.worstTrade.pnlRp < 0 && (
-            <span>
-              Loss terbesar:{" "}
-              <b className="text-rose-600">
-                {perfStats.worstTrade.ticker} ({fmtDec.format(perfStats.worstTrade.pnlPct)}% / Rp{" "}
-                {fmtInt.format(perfStats.worstTrade.pnlRp)})
-              </b>
+              {perfStats.expectancyPct > 0
+                ? "Expectancy Positif · Strategi Menghasilkan"
+                : "Expectancy Negatif · Evaluasi Disiplin SL"}
             </span>
           )}
         </div>
-      )}
-    </>
-  )}
-</section>
+
+        {perfStats.totalTrades === 0 ? (
+          <p className="mt-3 rounded-xl bg-slate-50 px-3.5 py-2.5 text-xs text-slate-500">
+            Belum ada transaksi yang ditutup (<i>CLOSED</i>). Setelah Anda menutup posisi pertama lewat tombol{" "}
+            <b>Catat Jual</b>, Win Rate, Expectancy, dan Penambahan Portofolio Bersih akan otomatis muncul di sini.
+          </p>
+        ) : (
+          <>
+            <div className="mt-3.5 grid grid-cols-2 gap-3 md:grid-cols-4">
+              {/* 1. Penambahan Portofolio Bersih */}
+              <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
+                <div className="text-[11px] font-medium text-slate-500">Penambahan Portofolio Bersih</div>
+                <div
+                  className={`mt-1 text-base font-bold tabular-nums md:text-lg ${
+                    perfStats.realizedNetRp > 0
+                      ? "text-emerald-600"
+                      : perfStats.realizedNetRp < 0
+                      ? "text-rose-600"
+                      : "text-slate-800"
+                  }`}
+                >
+                  {perfStats.realizedNetRp > 0 ? "+" : ""}
+                  Rp {fmtInt.format(perfStats.realizedNetRp)}
+                </div>
+                <div className="mt-0.5 text-[11px] text-slate-500">
+                  Total bersih (Realized + Floating):{" "}
+                  <b
+                    className={
+                      perfStats.realizedNetRp + totals.pnl >= 0 ? "text-emerald-700" : "text-rose-700"
+                    }
+                  >
+                    {perfStats.realizedNetRp + totals.pnl >= 0 ? "+" : ""}
+                    Rp {fmtInt.format(perfStats.realizedNetRp + totals.pnl)}
+                  </b>
+                </div>
+              </div>
+
+              {/* 2. Win Rate Aktual */}
+              <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
+                <div className="text-[11px] font-medium text-slate-500">Win Rate Aktual</div>
+                <div className="mt-1 text-base font-bold tabular-nums text-slate-900 md:text-lg">
+                  {fmtDec.format(perfStats.winRatePct)}%
+                </div>
+                <div className="mt-0.5 text-[11px] text-slate-500">
+                  <span className="font-semibold text-emerald-600">{perfStats.wins} Win</span> ·{" "}
+                  <span className="font-semibold text-rose-600">{perfStats.losses} Loss</span> (dari{" "}
+                  {perfStats.totalTrades} trade)
+                </div>
+              </div>
+
+              {/* 3. Expectancy per Transaksi */}
+              <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
+                <div className="text-[11px] font-medium text-slate-500">Expectancy / Transaksi</div>
+                <div
+                  className={`mt-1 text-base font-bold tabular-nums md:text-lg ${
+                    perfStats.expectancyPct >= 0 ? "text-emerald-600" : "text-rose-600"
+                  }`}
+                >
+                  {perfStats.expectancyPct >= 0 ? "+" : ""}
+                  {fmtDec.format(perfStats.expectancyPct)}%
+                </div>
+                <div className="mt-0.5 text-[11px] tabular-nums text-slate-500">
+                  Rata-rata{" "}
+                  <b>
+                    {perfStats.expectancyRp >= 0 ? "+" : ""}
+                    Rp {fmtInt.format(perfStats.expectancyRp)}
+                  </b>{" "}
+                  / trade
+                </div>
+              </div>
+
+              {/* 4. Rasio Rata-rata Win vs Loss & Profit Factor */}
+              <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
+                <div className="text-[11px] font-medium text-slate-500">Avg Win vs Avg Loss</div>
+                <div className="mt-1 text-sm font-bold tabular-nums md:text-base">
+                  <span className="text-emerald-600">+{fmtDec.format(perfStats.avgWinPct)}%</span>
+                  <span className="mx-1 text-slate-400">/</span>
+                  <span className="text-rose-600">-{fmtDec.format(perfStats.avgLossPct)}%</span>
+                </div>
+                <div className="mt-0.5 text-[11px] text-slate-500">
+                  Profit Factor:{" "}
+                  <b>{perfStats.profitFactor === null ? "∞" : fmtDec.format(perfStats.profitFactor)}</b> ·
+                  Rata-rata {perfStats.avgHoldDays} hari
+                </div>
+              </div>
+            </div>
+
+            {/* Sorotan Trade Terbaik & Terburuk */}
+            {(perfStats.bestTrade || perfStats.worstTrade) && (
+              <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-1 border-t border-slate-100 pt-2.5 text-xs text-slate-600">
+                {perfStats.bestTrade && (
+                  <span>
+                    Trade terbaik:{" "}
+                    <b className="text-emerald-700">
+                      {perfStats.bestTrade.ticker} (+{fmtDec.format(perfStats.bestTrade.pnlPct)}% / +Rp{" "}
+                      {fmtInt.format(perfStats.bestTrade.pnlRp)})
+                    </b>
+                  </span>
+                )}
+                {perfStats.worstTrade && perfStats.worstTrade.pnlRp < 0 && (
+                  <span>
+                    Loss terbesar:{" "}
+                    <b className="text-rose-600">
+                      {perfStats.worstTrade.ticker} ({fmtDec.format(perfStats.worstTrade.pnlPct)}% / Rp{" "}
+                      {fmtInt.format(perfStats.worstTrade.pnlRp)})
+                    </b>
+                  </span>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </section>
+
       {/* Daftar Posisi Terbuka */}
       {loading ? (
         <div className="space-y-3">
@@ -567,87 +596,87 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
                   )}
                 </div>
 
-{/* Meteran Gradasi Kesehatan Posisi (Merah -> Kuning -> Hijau) + Rincian Penyebab */}
-{advice && (
-  <div className="mt-3.5 rounded-xl border border-slate-200/70 bg-white/95 px-3.5 py-3">
-    <div className="flex items-center justify-between text-xs">
-      <span className="font-semibold text-slate-700">Status Kesehatan Posisi</span>
-      <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold tabular-nums ${advice.healthColorCls}`}>
-        {advice.healthLabel} ({advice.healthScore}/100)
-      </span>
-    </div>
+                {/* Meteran Gradasi Kesehatan Posisi (Merah -> Kuning -> Hijau) + Rincian Penyebab */}
+                {advice && (
+                  <div className="mt-3.5 rounded-xl border border-slate-200/70 bg-white/95 px-3.5 py-3">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-semibold text-slate-700">Status Kesehatan Posisi</span>
+                      <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-bold tabular-nums ${advice.healthColorCls}`}>
+                        {advice.healthLabel} ({advice.healthScore}/100)
+                      </span>
+                    </div>
 
-    {/* Bar Spektrum Gradasi */}
-    <div className="relative mt-2 h-2.5 w-full rounded-full bg-gradient-to-r from-rose-600 via-amber-400 to-emerald-600">
-      <div
-        className="absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-slate-900 bg-white shadow-md transition-all"
-        style={{ left: `${advice.healthScore}%` }}
-        title={`Skor Kesehatan: ${advice.healthScore}/100`}
-      />
-    </div>
+                    {/* Bar Spektrum Gradasi */}
+                    <div className="relative mt-2 h-2.5 w-full rounded-full bg-gradient-to-r from-rose-600 via-amber-400 to-emerald-600">
+                      <div
+                        className="absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-slate-900 bg-white shadow-md transition-all"
+                        style={{ left: `${advice.healthScore}%` }}
+                        title={`Skor Kesehatan: ${advice.healthScore}/100`}
+                      />
+                    </div>
 
-    <div className="mt-1 flex justify-between text-[10px] font-medium text-slate-400">
-      <span>Kritis / Jual</span>
-      <span>Waspada / Stagnan</span>
-      <span>Sangat Aman</span>
-    </div>
+                    <div className="mt-1 flex justify-between text-[10px] font-medium text-slate-400">
+                      <span>Kritis / Jual</span>
+                      <span>Waspada / Stagnan</span>
+                      <span>Sangat Aman</span>
+                    </div>
 
-    {/* Ringkasan Chip Penyebab Skor */}
-    <div className="mt-2.5 flex flex-wrap gap-1.5 border-t border-slate-100 pt-2.5">
-      {advice.healthReasons.map((r, idx) => {
-        const isPos = r.delta > 0 && r.label !== "Tren Supertrend Bullish";
-        const isNeg = r.delta < 0;
-        const chipCls = isNeg
-          ? "bg-rose-50 text-rose-700 border-rose-200"
-          : isPos
-          ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-          : "bg-slate-50 text-slate-600 border-slate-200";
-        const deltaText =
-          r.label === "Tren Supertrend Bullish"
-            ? "Dasar 68"
-            : r.delta > 0
-            ? `+${r.delta}`
-            : r.delta < 0
-            ? `${r.delta}`
-            : "0";
+                    {/* Ringkasan Chip Penyebab Skor */}
+                    <div className="mt-2.5 flex flex-wrap gap-1.5 border-t border-slate-100 pt-2.5">
+                      {advice.healthReasons.map((r, idx) => {
+                        const isPos = r.delta > 0 && r.label !== "Tren Supertrend Bullish";
+                        const isNeg = r.delta < 0;
+                        const chipCls = isNeg
+                          ? "bg-rose-50 text-rose-700 border-rose-200"
+                          : isPos
+                          ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                          : "bg-slate-50 text-slate-600 border-slate-200";
+                        const deltaText =
+                          r.label === "Tren Supertrend Bullish"
+                            ? "Dasar 68"
+                            : r.delta > 0
+                            ? `+${r.delta}`
+                            : r.delta < 0
+                            ? `${r.delta}`
+                            : "0";
 
-        return (
-          <span
-            key={idx}
-            title={r.detail}
-            className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium ${chipCls}`}
-          >
-            <span>{r.label}</span>
-            <b className="tabular-nums">({deltaText})</b>
-          </span>
-        );
-      })}
-    </div>
+                        return (
+                          <span
+                            key={idx}
+                            title={r.detail}
+                            className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium ${chipCls}`}
+                          >
+                            <span>{r.label}</span>
+                            <b className="tabular-nums">({deltaText})</b>
+                          </span>
+                        );
+                      })}
+                    </div>
 
-    {/* Rincian Penjelasan Lengkap (Opsional Buka-Tutup) */}
-    <details className="mt-2 text-[11px] text-slate-500">
-      <summary className="cursor-pointer select-none font-medium text-slate-500 hover:text-slate-700">
-        Lihat penjelasan faktor skor
-      </summary>
-      <ul className="mt-1.5 space-y-1 pl-1">
-        {advice.healthReasons.map((r, idx) => (
-          <li key={idx} className="flex items-start justify-between gap-2">
-            <span>
-              • <b className="text-slate-700">{r.label}:</b> {r.detail}
-            </span>
-            <span
-              className={`shrink-0 font-bold tabular-nums ${
-                r.delta < 0 ? "text-rose-600" : r.delta > 0 ? "text-emerald-600" : "text-slate-500"
-              }`}
-            >
-              {r.delta > 0 ? `+${r.delta}` : r.delta}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </details>
-  </div>
-)}
+                    {/* Rincian Penjelasan Lengkap (Opsional Buka-Tutup) */}
+                    <details className="mt-2 text-[11px] text-slate-500">
+                      <summary className="cursor-pointer select-none font-medium text-slate-500 hover:text-slate-700">
+                        Lihat penjelasan faktor skor
+                      </summary>
+                      <ul className="mt-1.5 space-y-1 pl-1">
+                        {advice.healthReasons.map((r, idx) => (
+                          <li key={idx} className="flex items-start justify-between gap-2">
+                            <span>
+                              <b className="text-slate-700">{r.label}:</b> {r.detail}
+                            </span>
+                            <span
+                              className={`shrink-0 font-bold tabular-nums ${
+                                r.delta < 0 ? "text-rose-600" : r.delta > 0 ? "text-emerald-600" : "text-slate-500"
+                              }`}
+                            >
+                              {r.delta > 0 ? `+${r.delta}` : r.delta}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  </div>
+                )}
 
                 {/* Kotak Rekomendasi Tindakan Besok */}
                 {advice ? (
@@ -715,6 +744,7 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
                     <button
                       onClick={() => {
                         setClosingPos({ pos, advice });
+                        setSellDate(new Date().toISOString().slice(0, 10));
                         setSellPrice(
                           advice
                             ? String(floorToIdxTick(advice.currentPrice))
@@ -727,12 +757,29 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
                     </button>
                   </div>
 
-                  <button
-                    onClick={() => handleDelete(pos.id)}
-                    className="text-xs text-slate-400 hover:text-rose-600"
-                  >
-                    Hapus
-                  </button>
+                  {confirmDeleteId === pos.id ? (
+                    <div className="flex items-center gap-2 text-xs">
+                      <button
+                        onClick={() => handleDelete(pos.id)}
+                        className="font-semibold text-rose-600 hover:underline"
+                      >
+                        Yakin Hapus?
+                      </button>
+                      <button
+                        onClick={() => setConfirmDeleteId(null)}
+                        className="text-slate-400 hover:text-slate-600"
+                      >
+                        Batal
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmDeleteId(pos.id)}
+                      className="text-xs text-slate-400 hover:text-rose-600"
+                    >
+                      Hapus
+                    </button>
+                  )}
                 </div>
               </div>
             );
@@ -805,6 +852,7 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
                 <input
                   required
                   type="date"
+                  min={closingPos.pos.buy_date}
                   value={sellDate}
                   onChange={(e) => setSellDate(e.target.value)}
                   className={inputCls}
@@ -821,6 +869,22 @@ const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList
                 />
               </label>
             </div>
+
+            {closePreview && (
+              <div className="flex items-center justify-between rounded-xl bg-slate-50 px-3.5 py-2.5 text-xs">
+                <span className="text-slate-600">Estimasi Realized P/L:</span>
+                <span
+                  className={`font-bold tabular-nums ${
+                    closePreview.pnlRp >= 0 ? "text-emerald-600" : "text-rose-600"
+                  }`}
+                >
+                  {closePreview.pnlRp >= 0 ? "+" : ""}
+                  Rp {fmtInt.format(closePreview.pnlRp)} ({closePreview.pnlPct >= 0 ? "+" : ""}
+                  {fmtDec.format(closePreview.pnlPct)}%)
+                </span>
+              </div>
+            )}
+
             <div className="flex justify-end gap-2">
               <button
                 type="button"

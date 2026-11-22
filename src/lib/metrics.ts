@@ -141,7 +141,7 @@ export function metricsFromDb(d: any): Metrics | null {
   const atrPct = Number(d.atr_pct ?? 0);
 
   // Hitung ulang harga garis Supertrend & risiko SL (%) dari distAtr dan atrPct
-  let stLine: number | null = n(d.supertrend ?? d.st_line ?? d.stop_line);
+  let stLine: number | null = n(d.line ?? d.supertrend ?? d.st_line ?? d.stop_line);
   let slRiskPct: number | null = null;
 
   if (trend === 1 && distAtr !== null && atrPct > 0 && close > 0) {

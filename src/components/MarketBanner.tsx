@@ -57,6 +57,7 @@ export default function MarketBanner({ bull, total }: Props) {
     const last = st[st.length - 1];
     const bar = bars[bars.length - 1];
     const prev = bars.length > 1 ? bars[bars.length - 2].close : null;
+    const prev5 = bars.length > 5 ? bars[bars.length - 6].close : null;
     let days = 0;
     for (let i = st.length - 1; i >= 0 && st[i].trend === last.trend; i--) days++;
     const line = last.trend === 1 ? last.up : last.dn;
@@ -67,6 +68,7 @@ export default function MarketBanner({ bull, total }: Props) {
       line,
       dist: ((bar.close - line) / bar.close) * 100,
       change: prev ? (bar.close / prev - 1) * 100 : null,
+      change5d: prev5 ? (bar.close / prev5 - 1) * 100 : null,
       days,
       signal: last.signal,
     };
@@ -92,15 +94,17 @@ export default function MarketBanner({ bull, total }: Props) {
   }
 
   const bullish = calc.trend === 1;
+  const nearFlip = bullish && calc.dist < 1.2;
   const breadth = total > 0 ? (bull / total) * 100 : null;
 
-  // Panduan porsi modal berdasarkan rezim IHSG & breadth pasar
-  const regimeAdvice =
-    bullish && (breadth === null || breadth >= 45)
-      ? "Rezim kondusif — siap alokasi penuh (4–5 slot) pada Top Pick (≥ 86)."
-      : bullish
-      ? "IHSG bullish tapi selektif — fokus hanya pada Top Pick (≥ 86) ber-RS tinggi."
-      : "Rezim IHSG bearish — kurangi agresi (maks 2–3 slot) pada Top Pick (≥ 86) dan patuhi SL otomatis.";
+  // Panduan porsi modal berdasarkan rezim IHSG, jarak ke garis SL indeks, & breadth pasar
+  const regimeAdvice = !bullish
+    ? "Rezim IHSG bearish — kurangi agresi (maks 2–3 slot) hanya pada Top Pick (≥ 86) dan patuhi SL otomatis."
+    : nearFlip
+    ? `IHSG bullish tapi tipis (${pct(calc.dist, true)} di atas garis) — waspada potensi flip bearish; batasi 3–4 slot.`
+    : breadth === null || breadth >= 45
+    ? "Rezim kondusif — siap alokasi penuh (4–5 slot) pada Top Pick (≥ 86)."
+    : "IHSG bullish tapi selektif — fokus hanya pada Top Pick (≥ 86) ber-RS tinggi.";
 
   return (
     <section
@@ -117,7 +121,12 @@ export default function MarketBanner({ bull, total }: Props) {
               {calc.change !== null && (
                 <span className={`text-base font-semibold tabular-nums ${calc.change >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
                   {calc.change >= 0 ? "▲" : "▼"} {pct(Math.abs(calc.change))}
-                  <span className="ml-1 text-[11px] font-normal text-slate-400">vs kemarin</span>
+                  <span className="ml-1 text-[11px] font-normal text-slate-400">1H</span>
+                </span>
+              )}
+              {calc.change5d !== null && (
+                <span className={`text-xs font-medium tabular-nums ${calc.change5d >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                  ({pct(calc.change5d, true)} <span className="text-slate-400">5H</span>)
                 </span>
               )}
             </div>
@@ -167,7 +176,11 @@ export default function MarketBanner({ bull, total }: Props) {
               )}
             </div>
 
-            <div className={`mt-2.5 rounded-lg px-2.5 py-1.5 text-[11px] leading-snug ${bullish ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"}`}>
+            <div
+              className={`mt-2.5 rounded-lg px-2.5 py-1.5 text-[11px] leading-snug ${
+                !bullish || nearFlip ? "bg-amber-50 text-amber-800" : "bg-emerald-50 text-emerald-800"
+              }`}
+            >
               {regimeAdvice}
             </div>
 
@@ -181,7 +194,6 @@ export default function MarketBanner({ bull, total }: Props) {
   );
 }
 
-/** Grafik mini candlestick: 45 bar terakhir + garis Supertrend berwarna. */
 /** Grafik mini candlestick: 65 bar terakhir + garis Supertrend memenuhi penuh lebar kotak. */
 function CandleSpark({ st, bars }: { st: ReturnType<typeof supertrend>; bars: VBar[] }) {
   const N = Math.min(65, st.length, bars.length);
@@ -198,7 +210,6 @@ function CandleSpark({ st, bars }: { st: ReturnType<typeof supertrend>; bars: VB
   const max = Math.max(...allValues);
   const span = max - min || 1;
 
-  // Rasio lebar viewBox disesuaikan dengan kolom desktop (~700px) agar tidak menyisakan ruang kosong kiri-kanan
   const W = 720;
   const H = 115;
   const P = 4;
@@ -224,12 +235,10 @@ function CandleSpark({ st, bars }: { st: ReturnType<typeof supertrend>; bars: VB
       role="img"
       aria-label="Grafik candlestick IHSG 65 hari terakhir dengan garis Supertrend"
     >
-      {/* Garis Supertrend */}
       {stSegs.map((s, i) => (
         <path key={`st-${i}`} d={s.d} stroke={s.c} strokeWidth={2} fill="none" strokeLinecap="round" />
       ))}
 
-      {/* Candlestick OHLC */}
       {sliceBars.map((b, i) => {
         const xCenter = cx(i);
         const yHigh = y(b.high);
@@ -243,7 +252,6 @@ function CandleSpark({ st, bars }: { st: ReturnType<typeof supertrend>; bars: VB
 
         return (
           <g key={b.date}>
-            {/* Sumbu High-Low */}
             <line
               x1={xCenter}
               y1={yHigh}
@@ -253,7 +261,6 @@ function CandleSpark({ st, bars }: { st: ReturnType<typeof supertrend>; bars: VB
               strokeWidth={1.2}
               opacity={0.85}
             />
-            {/* Badan Open-Close */}
             <rect
               x={xCenter - candleW / 2}
               y={bodyTop}
