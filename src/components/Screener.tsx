@@ -332,12 +332,18 @@ export default function Screener() {
             Data per {fmtDate(latestDate)} · Supertrend ATR {ST_PERIOD}, multiplier {ST_MULT.toFixed(1)} · {summary.live} emiten aktif
           </p>
         </div>
-        <div className="flex gap-4 text-xs text-slate-600">
-          <span><b className="text-emerald-600">{summary.buy}</b> BUY baru</span>
-          <span><b className="text-rose-600">{summary.sell}</b> SELL baru</span>
-        </div>
+<div className="flex items-center gap-4 text-xs text-slate-600">
+  <span><b className="text-emerald-600">{summary.buy}</b> BUY baru</span>
+  <span><b className="text-rose-600">{summary.sell}</b> SELL baru</span>
+  <a
+    href="/portfolio"
+    className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-semibold text-slate-800 hover:bg-slate-50"
+  >
+    Portofolio Saya →
+  </a>
+</div>
       </div>
-
+      
       {summary.noMetrics > 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
           {summary.noMetrics} emiten belum punya skor setup. Jalankan upload dengan “Rebuild riwayat” agar terhitung.
