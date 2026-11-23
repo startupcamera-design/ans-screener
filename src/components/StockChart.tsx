@@ -226,29 +226,35 @@ export default function StockChart({ ticker }: { ticker: string }) {
     }
 
     const markers: SeriesMarker<Time>[] = [];
-    if (showST) {
+    if (showST && st.length > 0) {
       const lineOpts = {
         lineWidth: 2 as const,
         priceLineVisible: false,
         lastValueVisible: false,
         crosshairMarkerVisible: false,
       };
-      const up = chart.addLineSeries({ ...lineOpts, color: GREEN });
-      const dn = chart.addLineSeries({ ...lineOpts, color: RED });
-      const pad = bars.length - st.length;
 
-      up.setData(
-        bars.map((b, i) => {
-          const p = st[i - pad];
-          return p && p.trend === 1 ? { time: b.date as Time, value: p.up } : { time: b.date as Time };
-        })
-      );
-      dn.setData(
-        bars.map((b, i) => {
-          const p = st[i - pad];
-          return p && p.trend === -1 ? { time: b.date as Time, value: p.dn } : { time: b.date as Time };
-        })
-      );
+      // Pecah garis Supertrend menjadi segmen per arah tren agar tidak menarik garis diagonal melintasi area kosong
+      type Segment = { trend: 1 | -1; points: { time: Time; value: number }[] };
+      const segments: Segment[] = [];
+      let current: Segment | null = null;
+
+      for (const p of st) {
+        const val = p.trend === 1 ? p.up : p.dn;
+        if (!current || current.trend !== p.trend) {
+          current = { trend: p.trend, points: [] };
+          segments.push(current);
+        }
+        current.points.push({ time: p.date as Time, value: val });
+      }
+
+      for (const seg of segments) {
+        const series = chart.addLineSeries({
+          ...lineOpts,
+          color: seg.trend === 1 ? GREEN : RED,
+        });
+        series.setData(seg.points);
+      }
 
       // Garis acuan Order SL (fraksi BEI) di chart harian saat tren bullish
       const lastStPoint = st[st.length - 1];

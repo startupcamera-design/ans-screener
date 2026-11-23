@@ -8,6 +8,7 @@ import { Metrics, metricsFromDb } from "@/lib/metrics";
 import { percentileMap, scoreMetrics } from "@/lib/scoring";
 import {
   buildMorningActionText,
+  ceilToIdxTick,
   computePositionSizing,
   DEFAULT_TRADING_PREFS,
   floorToIdxTick,
@@ -31,6 +32,8 @@ type Row = {
   days_since_flip: number | null;
   stale: boolean;
   score: number | null;
+  eligible: boolean;
+  ineligibleReason: string | null;
   distAtr: number | null;
   stLine: number | null;
   slTickPrice: number | null; // garis SL sudah dibulatkan 1 tick BEI ke bawah
@@ -47,7 +50,16 @@ type HeldInfo = {
   isZeroRisk: boolean; // SL terpasang atau garis ST sudah di atas harga beli
 };
 
-type SortKey = "ticker" | "score" | "close" | "change_pct" | "avgValue" | "trend" | "distAtr" | "slRiskPct" | "days_since_flip";
+type SortKey =
+  | "ticker"
+  | "score"
+  | "close"
+  | "change_pct"
+  | "avgValue"
+  | "trend"
+  | "distAtr"
+  | "slRiskPct"
+  | "days_since_flip";
 type Preset = "prime" | "all" | "pullback" | "newbuy";
 type TrendFilter = "all" | "bull" | "bear";
 type Filters = {
@@ -77,7 +89,17 @@ const DEFAULTS: Filters = {
 };
 const DEFAULT_SORT: { key: SortKey; dir: 1 | -1 } = { key: "score", dir: -1 };
 const STORE_KEY = "ans-screener-v3";
-const SORT_KEYS: SortKey[] = ["ticker", "score", "close", "change_pct", "avgValue", "trend", "distAtr", "slRiskPct", "days_since_flip"];
+const SORT_KEYS: SortKey[] = [
+  "ticker",
+  "score",
+  "close",
+  "change_pct",
+  "avgValue",
+  "trend",
+  "distAtr",
+  "slRiskPct",
+  "days_since_flip",
+];
 
 const SORTS: { id: string; label: string; key: SortKey; dir: 1 | -1 }[] = [
   { id: "score", label: "Skor setup tertinggi", key: "score", dir: -1 },
@@ -93,7 +115,7 @@ const PRESETS: { id: Preset; label: string; hint: string }[] = [
   {
     id: "prime",
     label: "Top Pick (≥ 86)",
-    hint: "Kuintil teratas hasil backtest (skor ≥ 86), bullish, likuid, dan jarak ke garis SL ≤ 8%. Kandidat utama untuk swing 10–20 hari bursa.",
+    hint: "Kuintil teratas hasil backtest (skor ≥ 86) & bullish. Prioritaskan yang berstatus Risiko SL ≤ 8%; jika > 8%, pantau untuk entry saat pullback.",
   },
   { id: "all", label: "Semua", hint: "Semua emiten sesuai filter di bawah." },
   {
@@ -113,14 +135,18 @@ const idNum = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 2 });
 const idPrice = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 0 });
 const idCompact = new Intl.NumberFormat("id-ID", { notation: "compact", maximumFractionDigits: 1 });
 
+// Tab Top Pick menampilkan semua saham bullish skor >= 86 agar tidak ada kandidat elite yang tersembunyi diam-diam;
+// peringatan SL > 8% ditampilkan jelas di kolom Risiko SL, sedangkan Morning Action Sheet tetap menyaring ketat SL <= 8%.
 const matchPreset = (r: Row, p: Preset) =>
   p === "all"
     ? true
     : p === "prime"
-    ? r.trend === 1 && (r.score ?? 0) >= 86 && (r.slRiskPct === null || r.slRiskPct >= -8)
+    ? r.trend === 1 && (r.score ?? 0) >= 86
     : p === "pullback"
     ? r.trend === 1 && r.distAtr !== null && r.distAtr <= 2 && (r.barsInTrend ?? 0) >= 5
     : r.signal === "BUY";
+
+const isWideSl = (r: Row) => r.slRiskPct !== null && r.slRiskPct < -8;
 
 const parseNum = (s: string) => {
   const t = s.trim();
@@ -277,7 +303,10 @@ export default function Screener() {
               signal: d.signal,
               days_since_flip: d.days_since_flip === null ? null : Number(d.days_since_flip),
               stale,
-              score: res && res.eligible ? res.total : null,
+              // Tampilkan skor untuk semua emiten bullish yang punya metrik (selaras dengan halaman detail StockChart)
+              score: res && trend === 1 ? res.total : null,
+              eligible: res?.eligible ?? false,
+              ineligibleReason: res?.reason ?? null,
               distAtr: m?.distAtr ?? null,
               stLine,
               slTickPrice,
@@ -305,14 +334,15 @@ export default function Screener() {
   }, [rows]);
 
   // Peta saham yang sedang dipegang beserta status Zero Risk (untuk badge SUDAH DIPEGANG vs SIAP ADD-ON)
-  const heldMap = useMemo(() => {
+const heldMap = useMemo(() => {
     const map: Record<string, HeldInfo> = {};
     for (const p of openPositions) {
       const r = rowByTicker.get(p.ticker);
       const slActive = p.sl_installed ?? r?.slTickPrice ?? null;
+      const netBreakeven = ceilToIdxTick(p.buy_price * 1.004);
       const isZeroRisk =
         slActive !== null &&
-        slActive >= p.buy_price &&
+        slActive >= netBreakeven &&
         r !== undefined &&
         r.trend === 1 &&
         (r.distAtr === null || (r.distAtr >= 0.5 && r.distAtr <= 2.2));
@@ -378,23 +408,27 @@ export default function Screener() {
     const list = base.filter((r) => matchPreset(r, f.preset));
     const { key, dir } = sort;
     return list.sort((a, b) => {
-      const av = a[key], bv = b[key];
+      // Pada tab Top Pick & default sort skor, utamakan yang SL <= 8% lebih dulu bila skornya sama/tinggi
+      const av = a[key],
+        bv = b[key];
       if (av === null && bv === null) return a.ticker.localeCompare(b.ticker);
       if (av === null) return 1;
       if (bv === null) return -1;
       if (typeof av === "string" && typeof bv === "string") return av.localeCompare(bv) * dir;
-      return ((av as number) - (bv as number)) * dir;
+      const cmp = ((av as number) - (bv as number)) * dir;
+      if (cmp !== 0) return cmp;
+      return Number(isWideSl(a)) - Number(isWideSl(b));
     });
   }, [base, f.preset, sort]);
 
-  // Kandidat antrean beli untuk Morning Action Sheet (Top Pick >= 86, SL <= 8%, belum dipegang)
+  // Kandidat antrean beli untuk Morning Action Sheet (ketat: Top Pick >= 86, likuid, SL <= 8%, belum dipegang)
   const morningBuyCandidates: MorningBuyCandidate[] = useMemo(() => {
     return rows
       .filter(
         (r) =>
           !r.stale &&
           r.volume > 0 &&
-          (r.avgValue === null || r.avgValue >= MIN_AVG_VALUE) &&
+          r.eligible &&
           r.trend === 1 &&
           (r.score ?? 0) >= 86 &&
           r.slTickPrice !== null &&
@@ -450,13 +484,20 @@ return {
           detail: "",
           suggestedSl: r.slTickPrice,
           holdingBars: 1,
+          daysToTimeStop: 19,
           currentPrice: r.close,
+          netBreakevenPrice: ceilToIdxTick(pos.buy_price * 1.004),
           stLine: r.stLine ?? r.close,
           pnlRp: (r.close - pos.buy_price) * pos.lots * 100,
           pnlPct: ((r.close - pos.buy_price) / pos.buy_price) * 100,
           marketValue: r.close * pos.lots * 100,
           slRiskFromCurrentPct: r.slRiskPct ?? 0,
+          lockedPnlRp:
+            r.slTickPrice !== null ? (r.slTickPrice - pos.buy_price) * pos.lots * 100 : null,
+          lockedPnlPct:
+            r.slTickPrice !== null ? ((r.slTickPrice - pos.buy_price) / pos.buy_price) * 100 : null,
           isBreakevenOrBetter: (r.slTickPrice ?? 0) >= pos.buy_price,
+          currentSetupScore: r.score,
           addOnReady: false,
           addOnSuggestedLots: 0,
         },
@@ -502,7 +543,9 @@ return {
   };
 
   function toggleSort(key: SortKey) {
-    setSort((s) => (s.key === key ? { key, dir: (s.dir * -1) as 1 | -1 } : { key, dir: key === "ticker" || key === "distAtr" ? 1 : -1 }));
+    setSort((s) =>
+      s.key === key ? { key, dir: (s.dir * -1) as 1 | -1 } : { key, dir: key === "ticker" || key === "distAtr" ? 1 : -1 }
+    );
   }
 
   if (loading) return <Skeleton />;
@@ -522,7 +565,10 @@ return {
     return (
       <div className="rounded-xl border border-slate-200 bg-white p-8 text-center text-slate-600">
         Belum ada hasil Supertrend. Unggah data lewat halaman{" "}
-        <a className="font-medium text-emerald-700 underline" href="/admin/upload">Upload data</a>.
+        <a className="font-medium text-emerald-700 underline" href="/admin/upload">
+          Upload data
+        </a>
+        .
       </div>
     );
   }
@@ -585,10 +631,7 @@ return {
 
       {/* Bar Pengaturan Modal & Risk Sizing */}
       {showSizingBar && (
-        <form
-          onSubmit={handleSavePrefs}
-          className="rounded-2xl border border-emerald-200 bg-white p-4 shadow-sm"
-        >
+        <form onSubmit={handleSavePrefs} className="rounded-2xl border border-emerald-200 bg-white p-4 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <h2 className="text-sm font-bold text-slate-900">Pengaturan Position Sizing & Slot Portofolio</h2>
@@ -688,11 +731,15 @@ return {
               aria-selected={f.preset === p.id}
               onClick={() => setF({ preset: p.id })}
               className={`shrink-0 rounded-full border px-3.5 py-2 text-sm font-medium ${
-                f.preset === p.id ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                f.preset === p.id
+                  ? "border-slate-900 bg-slate-900 text-white"
+                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
               }`}
             >
               {p.label}
-              <span className={`ml-1.5 text-xs tabular-nums ${f.preset === p.id ? "text-slate-300" : "text-slate-400"}`}>{presetCounts[p.id]}</span>
+              <span className={`ml-1.5 text-xs tabular-nums ${f.preset === p.id ? "text-slate-300" : "text-slate-400"}`}>
+                {presetCounts[p.id]}
+              </span>
             </button>
           ))}
         </div>
@@ -709,7 +756,13 @@ return {
               className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 pr-9 text-sm outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
             />
             {q && (
-              <button onClick={() => setQ("")} aria-label="Hapus pencarian" className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full px-2 py-1 text-slate-400 hover:text-slate-700">✕</button>
+              <button
+                onClick={() => setQ("")}
+                aria-label="Hapus pencarian"
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full px-2 py-1 text-slate-400 hover:text-slate-700"
+              >
+                ✕
+              </button>
             )}
           </div>
           <div className="flex gap-2">
@@ -724,14 +777,20 @@ return {
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm"
               >
                 {sortId === "" && <option value="">Urutan kustom</option>}
-                {SORTS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+                {SORTS.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.label}
+                  </option>
+                ))}
               </select>
             </label>
             <button
               onClick={() => setShowFilters((v) => !v)}
               aria-expanded={showFilters}
               className={`inline-flex shrink-0 items-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-medium ${
-                showFilters ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                showFilters
+                  ? "border-slate-900 bg-slate-900 text-white"
+                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
               }`}
             >
               Filter
@@ -747,7 +806,9 @@ return {
           <div className="hidden border-t border-slate-100 pt-3 md:block">
             {panel}
             <div className="mt-3 flex justify-end">
-              <button onClick={reset} className="text-sm text-slate-500 hover:text-slate-800">Reset semua</button>
+              <button onClick={reset} className="text-sm text-slate-500 hover:text-slate-800">
+                Reset semua
+              </button>
             </div>
           </div>
         )}
@@ -760,11 +821,16 @@ return {
           <div className="absolute inset-x-0 bottom-0 flex max-h-[88vh] flex-col rounded-t-2xl bg-white shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
               <h2 className="text-base font-semibold">Filter</h2>
-              <button onClick={reset} className="text-sm text-slate-500">Reset</button>
+              <button onClick={reset} className="text-sm text-slate-500">
+                Reset
+              </button>
             </div>
             <div className="overflow-y-auto px-4 py-4">{panel}</div>
             <div className="border-t border-slate-100 p-3">
-              <button onClick={() => setShowFilters(false)} className="w-full rounded-xl bg-emerald-600 py-3 text-sm font-semibold text-white">
+              <button
+                onClick={() => setShowFilters(false)}
+                className="w-full rounded-xl bg-emerald-600 py-3 text-sm font-semibold text-white"
+              >
                 Tampilkan {filtered.length} emiten
               </button>
             </div>
@@ -779,14 +845,34 @@ return {
       </div>
 
       <details className="group rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm">
-        <summary className="cursor-pointer select-none font-medium text-slate-700">Panduan eksekusi EOD & cara membaca kolom</summary>
+        <summary className="cursor-pointer select-none font-medium text-slate-700">
+          Panduan eksekusi EOD & cara membaca kolom
+        </summary>
         <dl className="mt-3 grid gap-x-8 gap-y-2.5 text-slate-600 md:grid-cols-2">
-          <Def t="Skor (0–100)">Teruji backtest untuk swing 10–20 hari bursa. Fokus utama pada kuintil teratas (Skor ≥ 86) dan urutkan dari skor tertinggi.</Def>
-          <Def t="Order SL (Fraksi BEI)">Otomatis dibulatkan 1 tick BEI di bawah garis Supertrend ATR {ST_PERIOD} (mult {ST_MULT}) agar siap langsung dipasang di sekuritas. Hindari masuk jika risiko SL lebih dalam dari -8%.</Def>
-          <Def t="Lot Ideal (Position Sizing)">Dihitung otomatis dari batas risiko modal Anda per trade dan jarak ke Order SL (otomatis dipotong 50% jika IHSG Bearish).</Def>
-          <Def t="Batas Beli (+1,5%)">Harga limit order beli maksimal (sudah sesuai fraksi BEI). Jika harga pembukaan gap up di atas batas ini, lewati kandidat tersebut.</Def>
-          <Def t="Usia Tren (Bar)">Tren paling optimal di rentang 5–40 bar sejak sinyal BUY. Sinyal 1–4 bar masih rawan false breakout, sedangkan di atas 40 bar sudah matang.</Def>
-          <Def t="RS % & Nilai/hari">Peringkat kekuatan relatif 3 bulan (0–100%) dan rata-rata likuiditas 20 hari (minimal Rp {idNum.format(MIN_AVG_VALUE)}/hari).</Def>
+          <Def t="Skor (0–100)">
+            Teruji backtest untuk swing 10–20 hari bursa. Fokus utama pada kuintil teratas (Skor ≥ 86) dan urutkan dari skor
+            tertinggi.
+          </Def>
+          <Def t="Order SL (Fraksi BEI)">
+            Otomatis dibulatkan 1 tick BEI di bawah garis Supertrend ATR {ST_PERIOD} (mult {ST_MULT}) agar siap langsung dipasang di
+            sekuritas. Hindari entry langsung jika risiko SL lebih dalam dari -8% (tunggu pullback).
+          </Def>
+          <Def t="Lot Ideal (Position Sizing)">
+            Dihitung otomatis dari batas risiko modal Anda per trade dan jarak ke Order SL (otomatis dipotong 50% jika IHSG
+            Bearish).
+          </Def>
+          <Def t="Batas Beli (+1,5%)">
+            Harga limit order beli maksimal (sudah sesuai fraksi BEI). Jika harga pembukaan gap up di atas batas ini, lewati
+            kandidat tersebut.
+          </Def>
+          <Def t="Usia Tren (Bar)">
+            Tren paling optimal di rentang 5–40 bar sejak sinyal BUY. Sinyal 1–4 bar masih rawan false breakout, sedangkan di atas
+            40 bar sudah matang.
+          </Def>
+          <Def t="RS % & Nilai/hari">
+            Peringkat kekuatan relatif 3 bulan (0–100%) dan rata-rata likuiditas 20 hari (minimal Rp {idNum.format(MIN_AVG_VALUE)}
+            /hari).
+          </Def>
         </dl>
         <p className="mt-3 text-xs text-slate-500">Alat bantu analisis teknikal, bukan rekomendasi investasi.</p>
       </details>
@@ -797,23 +883,67 @@ return {
           <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
             <tr>
               <Th k="ticker" label="Ticker" sort={sort} onSort={toggleSort} />
-              <Th k="score" label="Skor" sort={sort} onSort={toggleSort} tip="Kuintil teratas ≥ 86 teruji unggul pada backtest" />
+              <Th
+                k="score"
+                label="Skor"
+                sort={sort}
+                onSort={toggleSort}
+                tip="Kuintil teratas ≥ 86 teruji unggul pada backtest"
+              />
               <Th k="close" label="Close" right sort={sort} onSort={toggleSort} />
               <Th k="change_pct" label="Chg %" right sort={sort} onSort={toggleSort} />
-              <th className="px-3 py-2.5 text-right font-medium" title="Batas maksimal limit order beli (+1,5% dibulatkan ke fraksi BEI)">Beli Maks</th>
-              <th className="px-3 py-2.5 text-right font-medium" title="Harga auto-SL (1 tick BEI di bawah garis Supertrend)">Order SL</th>
-              <Th k="slRiskPct" label="Risiko SL" right sort={sort} onSort={toggleSort} tip="Persentase rugi dari close jika kena Order SL (maksimal ideal -8%)" />
-              <th className="px-3 py-2.5 text-right font-medium" title="Ukuran lot ideal sesuai batas risiko modal & rezim IHSG">Lot Ideal</th>
-              <Th k="days_since_flip" label="Usia tren" sort={sort} onSort={toggleSort} tip="Ideal pada 5–40 bar sejak sinyal BUY" />
-              <th className="px-3 py-2.5 text-right font-medium" title="Peringkat kekuatan relatif 60 bar (0–100)">RS</th>
-              <Th k="avgValue" label="Nilai/hari" right sort={sort} onSort={toggleSort} tip="Rata-rata nilai transaksi 20 hari" />
+              <th
+                className="px-3 py-2.5 text-right font-medium"
+                title="Batas maksimal limit order beli (+1,5% dibulatkan ke fraksi BEI)"
+              >
+                Beli Maks
+              </th>
+              <th
+                className="px-3 py-2.5 text-right font-medium"
+                title="Harga auto-SL (1 tick BEI di bawah garis Supertrend)"
+              >
+                Order SL
+              </th>
+              <Th
+                k="slRiskPct"
+                label="Risiko SL"
+                right
+                sort={sort}
+                onSort={toggleSort}
+                tip="Persentase rugi dari close jika kena Order SL (maksimal ideal -8%)"
+              />
+              <th
+                className="px-3 py-2.5 text-right font-medium"
+                title="Ukuran lot ideal sesuai batas risiko modal & rezim IHSG"
+              >
+                Lot Ideal
+              </th>
+              <Th
+                k="days_since_flip"
+                label="Usia tren"
+                sort={sort}
+                onSort={toggleSort}
+                tip="Ideal pada 5–40 bar sejak sinyal BUY"
+              />
+              <th className="px-3 py-2.5 text-right font-medium" title="Peringkat kekuatan relatif 60 bar (0–100)">
+                RS
+              </th>
+              <Th
+                k="avgValue"
+                label="Nilai/hari"
+                right
+                sort={sort}
+                onSort={toggleSort}
+                tip="Rata-rata nilai transaksi 20 hari"
+              />
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {view.map((r) => {
               const held = heldMap[r.ticker];
+              const wideSl = isWideSl(r);
               const sizing =
-                r.trend === 1 && r.slTickPrice !== null
+                r.trend === 1 && r.slTickPrice !== null && !wideSl
                   ? computePositionSizing({
                       entryPrice: r.close,
                       stopLossPrice: r.slTickPrice,
@@ -852,10 +982,20 @@ return {
                             SUDAH DIPEGANG ({held.lots}L)
                           </span>
                         ))}
+                      {!r.eligible && r.ineligibleReason && (
+                        <span
+                          title={r.ineligibleReason}
+                          className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800"
+                        >
+                          {r.ineligibleReason}
+                        </span>
+                      )}
                       {r.stale && <span className="text-[10px] font-normal">({fmtDate(r.date)})</span>}
                     </div>
                   </td>
-                  <td className="px-3 py-2.5"><ScoreBadge score={r.score} /></td>
+                  <td className="px-3 py-2.5">
+                    <ScoreBadge score={r.score} />
+                  </td>
                   <td className="px-3 py-2.5 text-right tabular-nums">{idNum.format(r.close)}</td>
                   <td className={`px-3 py-2.5 text-right tabular-nums ${chgCls(r.change_pct)}`}>{fmtPct(r.change_pct, true)}</td>
                   <td className="px-3 py-2.5 text-right tabular-nums text-emerald-700">
@@ -866,32 +1006,46 @@ return {
                   </td>
                   <td
                     className={`px-3 py-2.5 text-right font-medium tabular-nums ${
-                      r.slRiskPct === null
-                        ? "text-slate-400"
-                        : r.slRiskPct < -8
-                        ? "text-rose-600"
-                        : "text-emerald-700"
+                      r.slRiskPct === null ? "text-slate-400" : wideSl ? "text-rose-600" : "text-emerald-700"
                     }`}
                   >
-                    {r.slRiskPct === null ? "–" : `${r.slRiskPct.toFixed(1)}%`}
+                    {r.slRiskPct === null ? (
+                      "–"
+                    ) : (
+                      <div className="leading-tight">
+                        <span>{r.slRiskPct.toFixed(1)}%</span>
+                        {wideSl && (
+                          <span className="block text-[10px] font-semibold text-rose-600">Tunggu pullback</span>
+                        )}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2.5 text-right tabular-nums">
-                    {sizing && sizing.lots > 0 ? (
+                    {wideSl ? (
+                      <span
+                        className="text-[11px] font-medium text-rose-500"
+                        title="Jarak SL > 8%, tunggu harga pullback mendekati garis Supertrend"
+                      >
+                        SL &gt; 8%
+                      </span>
+                    ) : sizing && sizing.lots > 0 ? (
                       <div className="leading-tight">
                         <span className="font-bold text-slate-900">{sizing.lots} L</span>
-                        <span className="block text-[10px] text-slate-400">
-                          {idCompact.format(sizing.estimatedCostRp)}
-                        </span>
+                        <span className="block text-[10px] text-slate-400">{idCompact.format(sizing.estimatedCostRp)}</span>
                       </div>
                     ) : (
                       <span className="text-slate-300">–</span>
                     )}
                   </td>
-                  <td className="px-3 py-2.5"><SignalCell r={r} /></td>
+                  <td className="px-3 py-2.5">
+                    <SignalCell r={r} />
+                  </td>
                   <td className="px-3 py-2.5 text-right text-xs tabular-nums text-slate-600">
                     {r.rsPct === null ? "–" : `${r.rsPct}%`}
                   </td>
-                  <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{r.avgValue === null ? "–" : idCompact.format(r.avgValue)}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">
+                    {r.avgValue === null ? "–" : idCompact.format(r.avgValue)}
+                  </td>
                 </tr>
               );
             })}
@@ -903,8 +1057,9 @@ return {
       <div className="grid gap-2.5 sm:grid-cols-2 lg:hidden">
         {view.map((r) => {
           const held = heldMap[r.ticker];
+          const wideSl = isWideSl(r);
           const sizing =
-            r.trend === 1 && r.slTickPrice !== null
+            r.trend === 1 && r.slTickPrice !== null && !wideSl
               ? computePositionSizing({
                   entryPrice: r.close,
                   stopLossPrice: r.slTickPrice,
@@ -939,6 +1094,11 @@ return {
                         DIPEGANG ({held.lots}L)
                       </span>
                     ))}
+                  {wideSl && (
+                    <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700">
+                      SL &gt; 8% · Tunggu pullback
+                    </span>
+                  )}
                   {r.rsPct !== null && (
                     <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">
                       RS {r.rsPct}%
@@ -956,7 +1116,7 @@ return {
                     <span>
                       SL <b className="tabular-nums text-rose-600">{idPrice.format(r.slTickPrice)}</b>{" "}
                       {r.slRiskPct !== null && (
-                        <b className={`tabular-nums ${r.slRiskPct < -8 ? "text-rose-600" : "text-emerald-700"}`}>
+                        <b className={`tabular-nums ${wideSl ? "text-rose-600" : "text-emerald-700"}`}>
                           ({r.slRiskPct.toFixed(1)}%)
                         </b>
                       )}
@@ -984,15 +1144,23 @@ return {
         <div className="rounded-2xl border border-dashed border-slate-300 bg-white py-12 text-center">
           <p className="font-medium text-slate-700">Tidak ada emiten yang cocok</p>
           <p className="mt-1 text-sm text-slate-500">Coba longgarkan filter atau pilih preset &ldquo;Semua&rdquo;.</p>
-          <button onClick={reset} className="mt-4 rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white">Reset filter</button>
+          <button onClick={reset} className="mt-4 rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white">
+            Reset filter
+          </button>
         </div>
       )}
 
       {pages > 1 && (
         <nav className="flex items-center justify-between text-sm" aria-label="Halaman">
-          <button disabled={page === 0} onClick={() => goPage(page - 1)} className={pageBtn}>← Sebelumnya</button>
-          <span className="text-slate-600">Halaman {page + 1} / {pages}</span>
-          <button disabled={page >= pages - 1} onClick={() => goPage(page + 1)} className={pageBtn}>Berikutnya →</button>
+          <button disabled={page === 0} onClick={() => goPage(page - 1)} className={pageBtn}>
+            ← Sebelumnya
+          </button>
+          <span className="text-slate-600">
+            Halaman {page + 1} / {pages}
+          </span>
+          <button disabled={page >= pages - 1} onClick={() => goPage(page + 1)} className={pageBtn}>
+            Berikutnya →
+          </button>
         </nav>
       )}
 
@@ -1002,15 +1170,13 @@ return {
           className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
           onClick={() => setShowActionSheet(false)}
         >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-2xl space-y-4 rounded-2xl bg-white p-5 shadow-2xl"
-          >
+          <div onClick={(e) => e.stopPropagation()} className="w-full max-w-2xl space-y-4 rounded-2xl bg-white p-5 shadow-2xl">
             <div className="flex items-start justify-between gap-3">
               <div>
                 <h3 className="text-base font-bold text-slate-900">Morning Action Sheet · Rencana Besok Pagi</h3>
                 <p className="text-xs text-slate-500">
-                  Gabungan prioritas Jual/Exit, Update Auto-SL, dan Antrean Beli Top Pick sesuai sisa slot ({freeSlots}/{prefs.maxPositions}).
+                  Gabungan prioritas Jual/Exit, Update Auto-SL, dan Antrean Beli Top Pick sesuai sisa slot ({freeSlots}/
+                  {prefs.maxPositions}).
                 </p>
               </div>
               <button
@@ -1026,10 +1192,7 @@ return {
             </pre>
 
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <a
-                href="/portfolio"
-                className="text-xs font-semibold text-emerald-700 hover:underline"
-              >
+              <a href="/portfolio" className="text-xs font-semibold text-emerald-700 hover:underline">
                 Buka detail evaluasi di Portofolio →
               </a>
               <div className="flex gap-2">
@@ -1061,23 +1224,61 @@ function FilterPanel({ f, setF, staleCount }: { f: Filters; setF: (p: Partial<Fi
     <div className="space-y-4">
       <div className="grid gap-4 md:grid-cols-5">
         <Field label="Status tren">
-          <Segmented value={f.trend} onChange={(v) => setF({ trend: v as TrendFilter })} options={[["bull", "Bullish"], ["bear", "Bearish"], ["all", "Semua"]]} />
+          <Segmented
+            value={f.trend}
+            onChange={(v) => setF({ trend: v as TrendFilter })}
+            options={[
+              ["bull", "Bullish"],
+              ["bear", "Bearish"],
+              ["all", "Semua"],
+            ]}
+          />
         </Field>
         <Field label="Skor setup minimal">
-          <input value={f.minScore} onChange={(e) => setF({ minScore: e.target.value })} inputMode="numeric" placeholder="mis. 86" className={inputCls} />
+          <input
+            value={f.minScore}
+            onChange={(e) => setF({ minScore: e.target.value })}
+            inputMode="numeric"
+            placeholder="mis. 86"
+            className={inputCls}
+          />
         </Field>
         <Field label="Risiko SL maks (%)" hint="Jarak dari close ke Order SL">
-          <input value={f.maxSlPct} onChange={(e) => setF({ maxSlPct: e.target.value })} inputMode="decimal" placeholder="mis. 8" className={inputCls} />
+          <input
+            value={f.maxSlPct}
+            onChange={(e) => setF({ maxSlPct: e.target.value })}
+            inputMode="decimal"
+            placeholder="mis. 8"
+            className={inputCls}
+          />
         </Field>
         <Field label="Jarak maks (ATR)" hint="1 ATR ≈ gerak harian">
-          <input value={f.maxDist} onChange={(e) => setF({ maxDist: e.target.value })} inputMode="decimal" placeholder="mis. 2" className={inputCls} />
+          <input
+            value={f.maxDist}
+            onChange={(e) => setF({ maxDist: e.target.value })}
+            inputMode="decimal"
+            placeholder="mis. 2"
+            className={inputCls}
+          />
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Harga min">
-            <input value={f.minPrice} onChange={(e) => setF({ minPrice: e.target.value })} inputMode="numeric" placeholder="0" className={inputCls} />
+            <input
+              value={f.minPrice}
+              onChange={(e) => setF({ minPrice: e.target.value })}
+              inputMode="numeric"
+              placeholder="0"
+              className={inputCls}
+            />
           </Field>
           <Field label="Harga maks">
-            <input value={f.maxPrice} onChange={(e) => setF({ maxPrice: e.target.value })} inputMode="numeric" placeholder="bebas" className={inputCls} />
+            <input
+              value={f.maxPrice}
+              onChange={(e) => setF({ maxPrice: e.target.value })}
+              inputMode="numeric"
+              placeholder="bebas"
+              className={inputCls}
+            />
           </Field>
         </div>
       </div>
@@ -1085,8 +1286,12 @@ function FilterPanel({ f, setF, staleCount }: { f: Filters; setF: (p: Partial<Fi
         <Check checked={f.liquidOnly} onChange={(v) => setF({ liquidOnly: v })}>
           Hanya saham likuid (≥ Rp {idNum.format(MIN_AVG_VALUE)}/hari)
         </Check>
-        <Check checked={f.hideNoVol} onChange={(v) => setF({ hideNoVol: v })}>Sembunyikan yang tidak ada transaksi hari ini</Check>
-        <Check checked={f.hideStale} onChange={(v) => setF({ hideStale: v })}>Sembunyikan data lama ({staleCount})</Check>
+        <Check checked={f.hideNoVol} onChange={(v) => setF({ hideNoVol: v })}>
+          Sembunyikan yang tidak ada transaksi hari ini
+        </Check>
+        <Check checked={f.hideStale} onChange={(v) => setF({ hideStale: v })}>
+          Sembunyikan data lama ({staleCount})
+        </Check>
       </div>
     </div>
   );
@@ -1104,17 +1309,36 @@ function Skeleton() {
       <div className="h-44 animate-pulse rounded-2xl bg-slate-200/70" />
       <div className="h-8 w-48 animate-pulse rounded bg-slate-200/70" />
       <div className="h-28 animate-pulse rounded-2xl bg-slate-200/70" />
-      {[0, 1, 2, 3].map((i) => <div key={i} className="h-24 animate-pulse rounded-2xl bg-slate-200/70" />)}
+      {[0, 1, 2, 3].map((i) => (
+        <div key={i} className="h-24 animate-pulse rounded-2xl bg-slate-200/70" />
+      ))}
     </div>
   );
 }
 
 function Th({
-  k, label, right, sort, onSort, tip,
-}: { k: SortKey; label: string; right?: boolean; sort: { key: SortKey; dir: 1 | -1 }; onSort: (k: SortKey) => void; tip?: string }) {
+  k,
+  label,
+  right,
+  sort,
+  onSort,
+  tip,
+}: {
+  k: SortKey;
+  label: string;
+  right?: boolean;
+  sort: { key: SortKey; dir: 1 | -1 };
+  onSort: (k: SortKey) => void;
+  tip?: string;
+}) {
   const active = sort.key === k;
   return (
-    <th scope="col" title={tip} aria-sort={active ? (sort.dir === 1 ? "ascending" : "descending") : "none"} className={`px-3 py-2.5 font-medium ${right ? "text-right" : "text-left"}`}>
+    <th
+      scope="col"
+      title={tip}
+      aria-sort={active ? (sort.dir === 1 ? "ascending" : "descending") : "none"}
+      className={`px-3 py-2.5 font-medium ${right ? "text-right" : "text-left"}`}
+    >
       <button onClick={() => onSort(k)} className={`inline-flex items-center gap-1 hover:text-slate-900 ${active ? "text-slate-900" : ""}`}>
         {label}
         <span className="w-2 text-[10px]">{active ? (sort.dir === 1 ? "▲" : "▼") : ""}</span>
@@ -1136,7 +1360,12 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 function Check({ checked, onChange, children }: { checked: boolean; onChange: (v: boolean) => void; children: React.ReactNode }) {
   return (
     <label className="flex cursor-pointer items-start gap-2.5 rounded-lg py-1.5">
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-600" />
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-600"
+      />
       <span>{children}</span>
     </label>
   );
@@ -1170,13 +1399,27 @@ function Def({ t, children }: { t: string; children: React.ReactNode }) {
 }
 
 function ScoreBadge({ score }: { score: number | null }) {
-  if (score === null) return <span className="text-xs text-slate-300" title="Tidak diberi skor (bearish, kurang likuid, atau data lama)">–</span>;
-  return <span className={`inline-block min-w-[2.25rem] rounded-full px-2 py-0.5 text-center text-xs font-bold tabular-nums ${scoreTone(score)}`}>{score}</span>;
+  if (score === null)
+    return (
+      <span className="text-xs text-slate-300" title="Tidak diberi skor (bearish atau data lama)">
+        –
+      </span>
+    );
+  return (
+    <span className={`inline-block min-w-[2.25rem] rounded-full px-2 py-0.5 text-center text-xs font-bold tabular-nums ${scoreTone(score)}`}>
+      {score}
+    </span>
+  );
 }
 
 function ScoreCircle({ score }: { score: number | null }) {
   return score === null ? (
-    <div className="flex h-12 w-12 shrink-0 flex-col items-center justify-center self-center rounded-full border border-dashed border-slate-300 text-xs text-slate-400" title="Tanpa skor">–</div>
+    <div
+      className="flex h-12 w-12 shrink-0 flex-col items-center justify-center self-center rounded-full border border-dashed border-slate-300 text-xs text-slate-400"
+      title="Tanpa skor"
+    >
+      –
+    </div>
   ) : (
     <div className={`flex h-12 w-12 shrink-0 flex-col items-center justify-center self-center rounded-full ${scoreTone(score)}`}>
       <span className="text-base font-bold leading-none tabular-nums">{score}</span>
@@ -1196,7 +1439,9 @@ function TrendBadge({ trend }: { trend: 1 | -1 }) {
 function SignalCell({ r }: { r: Row }) {
   if (r.signal) {
     return (
-      <span className={`rounded px-1.5 py-0.5 text-xs font-bold text-white ${r.signal === "BUY" ? "bg-emerald-600" : "bg-rose-600"}`}>
+      <span
+        className={`rounded px-1.5 py-0.5 text-xs font-bold text-white ${r.signal === "BUY" ? "bg-emerald-600" : "bg-rose-600"}`}
+      >
         {r.signal} baru
       </span>
     );

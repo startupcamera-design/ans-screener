@@ -1,11 +1,11 @@
 import type { ScoreResult } from "@/lib/scoring";
 
 /**
- * Pewarnaan skor selaras dengan hasil backtest Scoring v2 (ATR 10, Mult 1.5):
- * - >= 86 : Elite Top Pick (Top ~4% bursa — rata-rata +2.90% / 10h)
- * - 71-85 : Kuat · Q5 (Kuintil teratas / Top 20% — rata-rata +1.25% / 10h)
- * - 57-70 : Cukup · Q4 (Menengah atas)
- * - < 57  : Lemah / Sideways · Q1-Q3 (Hindari)
+ * Pewarnaan skor selaras dengan hasil Audit Final (W4: Seimbang + Varian D, ATR 10, Mult 1.5):
+ * - >= 86 : Elite Top Pick (Top ~4% bursa — rata-rata +3.05% / 10h, win rate 50.8%, PF 1.70)
+ * - 71-85 : Kuat · Q5 (Kuintil teratas / Top 20% — rata-rata +1.20% / 10h)
+ * - 57-70 : Cukup · Q4 (Menengah atas — rata-rata +0.45% / 10h)
+ * - < 57  : Lemah / Sideways · Q1-Q3 (Hindari — rata-rata negatif)
  */
 export function scoreTone(total: number) {
   if (total >= 86) return "bg-emerald-600 text-white shadow-sm";
@@ -19,14 +19,14 @@ function scoreVerdict(total: number) {
     return {
       badge: "Elite Top Pick · Top ~4%",
       cls: "bg-emerald-50 text-emerald-900 border-emerald-200",
-      desc: "Kandidat prioritas utama (backtest +2.90% / 10h, win rate 51.6%). Layak langsung dieksekusi jika risiko SL ≤ 8% dan tidak gap up > 1,5%.",
+      desc: "Kandidat prioritas utama (audit final +3.05% / 10h, win rate 50.8%, Profit Factor 1.70). Siap dieksekusi jika risiko SL ≤ 8% dan tidak gap up > 1,5%.",
     };
   }
   if (total >= 71) {
     return {
       badge: "Kuat · Q5 (Top 20%)",
       cls: "bg-teal-50/70 text-teal-900 border-teal-200",
-      desc: "Masuk kuintil teratas bursa (backtest +1.25% / 10h). Layak dipertimbangkan sebagai alternatif jika kandidat skor ≥ 86 sedang kosong.",
+      desc: "Masuk kuintil teratas bursa (audit +1.20% / 10h). Layak dipertimbangkan sebagai alternatif jika kandidat skor ≥ 86 sedang kosong.",
     };
   }
   if (total >= 57) {
@@ -39,7 +39,7 @@ function scoreVerdict(total: number) {
   return {
     badge: "Lemah / Sideways · Q1–Q3",
     cls: "bg-rose-50/70 text-rose-800 border-rose-200",
-    desc: "Terkena penalti struktur tren atau momentum lemah (rata-rata return negatif pada backtest). Hindari untuk posisi baru.",
+    desc: "Terkena penalti struktur tren atau momentum lemah (rata-rata return negatif pada audit). Hindari untuk posisi baru.",
   };
 }
 
@@ -63,21 +63,60 @@ export default function ScoreBreakdown({ result }: { result: ScoreResult }) {
     .sort((a, b) => b.weight - a.weight);
   const infoParts = result.parts.filter((p) => p.weight === 0);
 
-  // Hitung skor mentah sebelum penalti struktural (anti-sideways / di bawah EMA50 / ret60 <= 0)
-  const totalWeight = activeParts.reduce((s, p) => s + p.weight, 0);
-  const rawScore =
-    totalWeight > 0
-      ? Math.round((activeParts.reduce((s, p) => s + p.weight * p.fraction, 0) / totalWeight) * 100)
-      : result.total;
+  // Ambil skor mentah & daftar penalti langsung dari ScoreResult (Varian D)
+  const rawScore = result.rawTotal ?? result.total;
   const penaltyPoints = Math.max(0, rawScore - result.total);
+  const penalties = result.penalties ?? [];
 
-  const trendPart = activeParts.find((p) => p.key === "trendQuality");
+  const getPart = (key: string) => activeParts.find((p) => p.key === key);
+  const trendPart = getPart("trendQuality");
+  const proxPart = getPart("proximity");
+  const pullPart = getPart("pullback");
+  const volPart = getPart("volume");
+  const agePart = getPart("trendAge");
+
   const isSidewaysWarning = trendPart?.detail.startsWith("Waspada sideways:") ?? false;
 
-  // Ringkasan cepat faktor terkuat & catatan terlemah
+  // Ringkasan cepat faktor terkuat & terlemah
   const sortedByScoreRatio = [...activeParts].sort((a, b) => b.fraction - a.fraction);
   const strongest = sortedByScoreRatio[0];
   const weakest = sortedByScoreRatio[sortedByScoreRatio.length - 1];
+
+  // Sintesis karakter setup untuk pembacaan cepat kualitas saham
+  const entryTimingScore = ((proxPart?.fraction ?? 0) + (pullPart?.fraction ?? 0)) / 2;
+  const quickInsights: { label: string; tone: "good" | "warn" | "bad" }[] = [];
+
+  if (penaltyPoints === 0) {
+    quickInsights.push({ label: "Struktur Tren Bersih", tone: "good" });
+  } else {
+    quickInsights.push({ label: "Struktur Kena Penalti", tone: "bad" });
+  }
+
+  if (entryTimingScore >= 0.75) {
+    quickInsights.push({ label: "Posisi Entry Ideal", tone: "good" });
+  } else if (entryTimingScore >= 0.45) {
+    quickInsights.push({ label: "Entry Cukup Dekat", tone: "warn" });
+  } else {
+    quickInsights.push({ label: "Harga Sudah Lari Jauh", tone: "bad" });
+  }
+
+  if ((volPart?.fraction ?? 0) >= 0.7) {
+    quickInsights.push({ label: "Tekanan Jual Mereda", tone: "good" });
+  } else if ((volPart?.fraction ?? 0) < 0.35) {
+    quickInsights.push({ label: "Volume Masih Ramai", tone: "warn" });
+  }
+
+  if ((agePart?.fraction ?? 0) >= 0.9) {
+    quickInsights.push({ label: "Fase Tren Matang", tone: "good" });
+  } else if ((agePart?.fraction ?? 0) <= 0.3) {
+    quickInsights.push({ label: "Sinyal Baru (Dini)", tone: "warn" });
+  }
+
+  const chipStyle = {
+    good: "bg-emerald-50 text-emerald-800 border-emerald-200",
+    warn: "bg-amber-50 text-amber-800 border-amber-200",
+    bad: "bg-rose-50 text-rose-800 border-rose-200",
+  };
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4">
@@ -111,18 +150,54 @@ export default function ScoreBreakdown({ result }: { result: ScoreResult }) {
         )}
       </div>
 
+      {/* Chip Diagnosis Cepat Kualitas Saham */}
+      <div className="mt-2.5 flex flex-wrap gap-1.5">
+        {quickInsights.map((q) => (
+          <span
+            key={q.label}
+            className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${chipStyle[q.tone]}`}
+          >
+            {q.tone === "good" ? "✓ " : q.tone === "warn" ? "• " : "✕ "}
+            {q.label}
+          </span>
+        ))}
+      </div>
+
       {/* Keterangan penalti jika struktur tren terdeteksi sideways / whipsaw / di bawah EMA50 */}
       {penaltyPoints > 0 && (
         <div className="mt-2.5 rounded-xl border border-rose-200 bg-rose-50/70 px-3 py-2 text-xs text-rose-800">
-          <div className="font-semibold">
-            Penalti Struktur Tren: -{penaltyPoints} poin{" "}
-            <span className="font-normal text-rose-700">(skor mentah {rawScore} → {result.total})</span>
+          <div className="flex flex-wrap items-center justify-between gap-1 font-semibold">
+            <span>
+              Penalti Struktur Tren: -{penaltyPoints} poin{" "}
+              <span className="font-normal text-rose-700">
+                (skor mentah {rawScore} → {result.total})
+              </span>
+            </span>
+            {result.penaltyMultiplier < 1 && (
+              <span className="rounded bg-rose-100 px-1.5 py-0.5 font-mono text-[10px] font-bold text-rose-800">
+                ×{result.penaltyMultiplier.toFixed(2)}
+              </span>
+            )}
           </div>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-rose-700">
-            {isSidewaysWarning
-              ? trendPart?.detail
-              : "Terkena pengali penalti struktur (di bawah EMA 50, frekuensi flip tinggi, ER rendah, atau return 3 bulan ≤ 0) sehingga tidak masuk Top Pick."}
-          </p>
+
+          {penalties.length > 0 ? (
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {penalties.map((item) => (
+                <span
+                  key={item}
+                  className="rounded-md border border-rose-200/80 bg-white/80 px-2 py-0.5 text-[11px] font-medium text-rose-700"
+                >
+                  {item}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-0.5 text-[11px] leading-relaxed text-rose-700">
+              {isSidewaysWarning
+                ? trendPart?.detail
+                : "Terkena pengali penalti struktur (di bawah EMA 50, frekuensi flip tinggi, ER rendah, atau return 3 bulan ≤ 0) sehingga tidak masuk Top Pick."}
+            </p>
+          )}
         </div>
       )}
 

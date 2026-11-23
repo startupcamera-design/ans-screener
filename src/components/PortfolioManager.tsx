@@ -17,6 +17,7 @@ import {
   EXIT_REASON_OPTIONS,
   floorToIdxTick,
   loadTradingPrefs,
+  saveTradingPrefs,
   type ExitReason,
   type MorningBuyCandidate,
   type PositionAdvice,
@@ -38,12 +39,20 @@ export default function PortfolioManager() {
   const [barsMap, setBarsMap] = useState<Record<string, VBar[]>>({});
   const [ihsgBullish, setIhsgBullish] = useState<boolean | null>(null);
   const [prefs, setPrefs] = useState<TradingPrefs>(DEFAULT_TRADING_PREFS);
+  const [scoreByTicker, setScoreByTicker] = useState<Record<string, number>>({});
   const [screenerTopPicks, setScreenerTopPicks] = useState<
     { ticker: string; score: number; close: number; slTickPrice: number; maxBuyPrice: number }[]
   >([]);
   const [latestMarketDate, setLatestMarketDate] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+
+  // Panel pengaturan modal & risiko
+  const [showPrefs, setShowPrefs] = useState(false);
+  const [capitalInput, setCapitalInput] = useState(String(DEFAULT_TRADING_PREFS.capitalRp));
+  const [riskInput, setRiskInput] = useState(String(DEFAULT_TRADING_PREFS.riskPerTradePct));
+  const [maxPosInput, setMaxPosInput] = useState(String(DEFAULT_TRADING_PREFS.maxPositions));
+  const [prefsSavedToast, setPrefsSavedToast] = useState(false);
 
   // Modal Morning Action Sheet
   const [showActionSheet, setShowActionSheet] = useState(false);
@@ -69,8 +78,32 @@ export default function PortfolioManager() {
   const [exitReason, setExitReason] = useState<ExitReason>("AUTO_SL");
 
   useEffect(() => {
-    setPrefs(loadTradingPrefs());
+    const loaded = loadTradingPrefs();
+    setPrefs(loaded);
+    setCapitalInput(String(loaded.capitalRp));
+    setRiskInput(String(loaded.riskPerTradePct));
+    setMaxPosInput(String(loaded.maxPositions));
   }, []);
+
+  function handleSavePrefs(e: React.FormEvent) {
+    e.preventDefault();
+    const cap = Number(capitalInput.replace(/\./g, "").replace(",", "."));
+    const rsk = Number(riskInput.replace(",", "."));
+    const mx = parseInt(maxPosInput, 10);
+
+    const next: TradingPrefs = {
+      capitalRp: Number.isFinite(cap) && cap > 0 ? cap : prefs.capitalRp,
+      riskPerTradePct: Number.isFinite(rsk) && rsk > 0 && rsk <= 10 ? rsk : prefs.riskPerTradePct,
+      maxPositions: Number.isInteger(mx) && mx >= 1 && mx <= 20 ? mx : prefs.maxPositions,
+    };
+    saveTradingPrefs(next);
+    setPrefs(next);
+    setCapitalInput(String(next.capitalRp));
+    setRiskInput(String(next.riskPerTradePct));
+    setMaxPosInput(String(next.maxPositions));
+    setPrefsSavedToast(true);
+    setTimeout(() => setPrefsSavedToast(false), 2000);
+  }
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -121,6 +154,7 @@ export default function PortfolioManager() {
         }))
       );
 
+      const allScores: Record<string, number> = {};
       const picks: {
         ticker: string;
         score: number;
@@ -133,10 +167,13 @@ export default function PortfolioManager() {
         const m = metrics[i];
         const stale = d.date < latest;
         if (!m || stale || Number(d.volume) <= 0 || Number(d.trend) !== 1) return;
-        if (m.avgValue20 < MIN_AVG_VALUE) return;
         const rsVal = pm.get(d.ticker) ?? null;
-        const res = scoreMetrics(m, rsVal);
-        if (!res || !res.eligible || res.total < 86) return;
+        const res = scoreMetrics(m, rsVal, MIN_AVG_VALUE);
+        if (!res || !res.eligible) return;
+
+        allScores[d.ticker] = res.total;
+
+        if (m.avgValue20 < MIN_AVG_VALUE || res.total < 86) return;
 
         const close = Number(d.close);
         const stLine = m.stLine ?? (d.line !== null && d.line !== undefined ? Number(d.line) : null);
@@ -153,7 +190,9 @@ export default function PortfolioManager() {
           maxBuyPrice: floorToIdxTick(close * 1.015, 0),
         });
       });
+
       picks.sort((a, b) => b.score - a.score);
+      setScoreByTicker(allScores);
       setScreenerTopPicks(picks);
 
       // Ambil histori candlestick untuk seluruh ticker posisi OPEN
@@ -207,15 +246,18 @@ export default function PortfolioManager() {
         const bars = barsMap[pos.ticker] ?? [];
         const st = bars.length >= ST_PERIOD ? supertrend(bars, ST_PERIOD, ST_MULT) : [];
         const sameTickerPositions = openOnly.filter((x) => x.ticker === pos.ticker);
+        const currentSetupScore =
+          scoreByTicker[pos.ticker] !== undefined ? scoreByTicker[pos.ticker] : null;
         const advice = evaluatePosition(pos, bars, st, {
           ihsgBullish,
           prefs,
           sameTickerPositions,
+          currentSetupScore,
         });
         return { pos, advice };
       })
       .sort((a, b) => (a.advice?.healthScore ?? 50) - (b.advice?.healthScore ?? 50));
-  }, [positions, barsMap, ihsgBullish, prefs]);
+  }, [positions, barsMap, ihsgBullish, prefs, scoreByTicker]);
 
   const openTickerSet = useMemo(
     () => new Set(enrichedOpen.map((x) => x.pos.ticker)),
@@ -288,15 +330,26 @@ export default function PortfolioManager() {
     let modal = 0;
     let nilai = 0;
     let actionNeeded = 0;
+    let totalLockedOrRiskRp = 0;
+    let unguardedCount = 0;
+
     for (const item of enrichedOpen) {
       const m = item.pos.buy_price * item.pos.lots * 100;
       modal += m;
       nilai += item.advice ? item.advice.marketValue : m;
-      if (item.advice && item.advice.code !== "HOLD") actionNeeded++;
+      if (item.advice && item.advice.code !== "HOLD" && item.advice.code !== "FRESH_ENTRY_MONITOR") {
+        actionNeeded++;
+      }
+      if (item.pos.sl_installed === null) {
+        unguardedCount++;
+      }
+      if (item.advice && item.advice.lockedPnlRp !== null) {
+        totalLockedOrRiskRp += item.advice.lockedPnlRp;
+      }
     }
     const pnl = nilai - modal;
     const pnlPct = modal > 0 ? (pnl / modal) * 100 : 0;
-    return { modal, nilai, pnl, pnlPct, actionNeeded };
+    return { modal, nilai, pnl, pnlPct, actionNeeded, totalLockedOrRiskRp, unguardedCount };
   }, [enrichedOpen]);
 
   // Preview Realized P/L pada modal tutup posisi
@@ -450,6 +503,12 @@ export default function PortfolioManager() {
 
         <div className="flex flex-wrap items-center gap-2">
           <button
+            onClick={() => setShowPrefs((v) => !v)}
+            className="rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          >
+            Atur Modal & Risiko
+          </button>
+          <button
             onClick={() => setShowActionSheet(true)}
             className="rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
           >
@@ -463,6 +522,68 @@ export default function PortfolioManager() {
           </button>
         </div>
       </div>
+
+      {/* Panel Pengaturan Modal, Risiko & Slot */}
+      {showPrefs && (
+        <form
+          onSubmit={handleSavePrefs}
+          className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm md:p-5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-bold text-slate-800">Pengaturan Modal & Manajemen Risiko</h2>
+              <p className="text-xs text-slate-500">
+                Digunakan untuk menghitung saran jumlah lot, batas risiko maksimal per posisi, dan alokasi slot.
+              </p>
+            </div>
+            {prefsSavedToast && (
+              <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-semibold text-emerald-800">
+                ✓ Tersimpan
+              </span>
+            )}
+          </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-4">
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">Total Modal Trading (Rp)</span>
+              <input
+                required
+                inputMode="numeric"
+                value={capitalInput}
+                onChange={(e) => setCapitalInput(e.target.value)}
+                className={inputCls}
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">Maks Risiko / Trade (%)</span>
+              <input
+                required
+                inputMode="decimal"
+                value={riskInput}
+                onChange={(e) => setRiskInput(e.target.value)}
+                className={inputCls}
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">Maks Slot Saham Aktif</span>
+              <input
+                required
+                inputMode="numeric"
+                value={maxPosInput}
+                onChange={(e) => setMaxPosInput(e.target.value)}
+                className={inputCls}
+              />
+            </label>
+            <div className="flex items-end">
+              <button
+                type="submit"
+                className="w-full rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+              >
+                Simpan Pengaturan
+              </button>
+            </div>
+          </div>
+        </form>
+      )}
 
       {err && (
         <div className="rounded-xl border border-rose-200 bg-rose-50 p-3.5 text-sm text-rose-700">
@@ -587,11 +708,25 @@ export default function PortfolioManager() {
           <div className="mt-1 text-lg font-bold tabular-nums text-slate-900 md:text-xl">
             Rp {fmtInt.format(totals.modal)}
           </div>
+          <div className="mt-0.5 text-[11px] text-slate-400">
+            Alokasi {prefs.capitalRp > 0 ? fmtDec.format((totals.modal / prefs.capitalRp) * 100) : 0}% dari modal
+          </div>
         </div>
         <div className="rounded-2xl border border-slate-200 bg-white p-4">
           <div className="text-xs font-medium text-slate-500">Nilai Pasar Saat Ini</div>
           <div className="mt-1 text-lg font-bold tabular-nums text-slate-900 md:text-xl">
             Rp {fmtInt.format(totals.nilai)}
+          </div>
+          <div className="mt-0.5 text-[11px] text-slate-500">
+            {totals.totalLockedOrRiskRp >= 0 ? (
+              <span className="text-emerald-600">
+                Terkunci di SL: +Rp {fmtInt.format(totals.totalLockedOrRiskRp)}
+              </span>
+            ) : (
+              <span className="text-slate-500">
+                Risiko SL aktif: Rp {fmtInt.format(totals.totalLockedOrRiskRp)}
+              </span>
+            )}
           </div>
         </div>
         <div className="rounded-2xl border border-slate-200 bg-white p-4">
@@ -611,6 +746,11 @@ export default function PortfolioManager() {
           <div className={`mt-1 text-lg font-bold tabular-nums md:text-xl ${totals.actionNeeded > 0 ? "text-amber-600" : "text-emerald-600"}`}>
             {totals.actionNeeded} posisi
           </div>
+          {totals.unguardedCount > 0 && (
+            <div className="mt-0.5 text-[11px] font-medium text-rose-600">
+              {totals.unguardedCount} posisi belum catat SL
+            </div>
+          )}
         </div>
       </div>
 
@@ -769,6 +909,18 @@ export default function PortfolioManager() {
         <div className="space-y-4">
           {enrichedOpen.map(({ pos, advice }) => {
             const cleanTicker = pos.ticker.replace(/\.JK$/, "");
+            const setupScore = advice?.currentSetupScore ?? null;
+            const scoreBadgeCls =
+              setupScore === null
+                ? ""
+                : setupScore >= 86
+                ? "bg-emerald-600 text-white"
+                : setupScore >= 71
+                ? "bg-emerald-100 text-emerald-800"
+                : setupScore >= 57
+                ? "bg-amber-100 text-amber-800"
+                : "bg-rose-100 text-rose-800";
+
             return (
               <div
                 key={pos.id}
@@ -776,16 +928,21 @@ export default function PortfolioManager() {
                   advice ? `${advice.borderCls} ${advice.cardTintCls}` : "border-slate-200 bg-white"
                 }`}
               >
-                {/* Baris Atas: Ticker + Badge Keputusan Besok */}
+                {/* Baris Atas: Ticker + Skor Screener + Badge Keputusan Besok */}
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <div className="flex flex-wrap items-center gap-2.5">
+                    <div className="flex flex-wrap items-center gap-2">
                       <Link
                         href={`/stock/${encodeURIComponent(pos.ticker)}`}
                         className="text-xl font-bold tracking-tight text-slate-900 hover:text-emerald-700"
                       >
                         {cleanTicker}
                       </Link>
+                      {setupScore !== null && (
+                        <span className={`rounded-md px-2 py-0.5 text-xs font-bold tabular-nums ${scoreBadgeCls}`}>
+                          Skor Screener: {setupScore}
+                        </span>
+                      )}
                       <span className="rounded-md bg-white/80 px-2 py-0.5 text-xs font-semibold text-slate-700 ring-1 ring-slate-200">
                         {pos.lots} Lot
                       </span>
@@ -891,12 +1048,15 @@ export default function PortfolioManager() {
                     <div className="text-sm font-bold text-slate-900">{advice.headline}</div>
                     <p className="mt-1 text-xs leading-relaxed text-slate-600">{advice.detail}</p>
 
-                    {/* Metrik Posisi */}
-                    <div className="mt-3 grid grid-cols-2 gap-3 border-t border-slate-200/80 pt-3 text-xs sm:grid-cols-5">
+                    {/* Metrik Posisi (6 Kolom Lengkap) */}
+                    <div className="mt-3 grid grid-cols-2 gap-3 border-t border-slate-200/80 pt-3 text-xs sm:grid-cols-3 lg:grid-cols-6">
                       <div>
                         <span className="text-slate-500">Harga Terakhir</span>
                         <div className="mt-0.5 font-bold tabular-nums text-slate-800">
                           Rp {fmtInt.format(advice.currentPrice)}
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          Impas net: Rp {fmtInt.format(advice.netBreakevenPrice)}
                         </div>
                       </div>
                       <div>
@@ -907,13 +1067,19 @@ export default function PortfolioManager() {
                           }`}
                         >
                           {advice.pnlRp >= 0 ? "+" : ""}
-                          {fmtDec.format(advice.pnlPct)}% ({advice.pnlRp >= 0 ? "+" : ""}
-                          {fmtInt.format(advice.pnlRp)})
+                          {fmtDec.format(advice.pnlPct)}%
+                        </div>
+                        <div className="text-[10px] tabular-nums text-slate-500">
+                          {advice.pnlRp >= 0 ? "+" : ""}Rp {fmtInt.format(advice.pnlRp)}
                         </div>
                       </div>
                       <div>
                         <span className="text-slate-500">SL Terpasang</span>
-                        <div className="mt-0.5 font-bold tabular-nums text-slate-800">
+                        <div
+                          className={`mt-0.5 font-bold tabular-nums ${
+                            pos.sl_installed ? "text-slate-800" : "text-rose-600"
+                          }`}
+                        >
                           {pos.sl_installed ? `Rp ${fmtInt.format(pos.sl_installed)}` : "Belum dicatat"}
                         </div>
                       </div>
@@ -922,11 +1088,45 @@ export default function PortfolioManager() {
                         <div className="mt-0.5 font-bold tabular-nums text-rose-600">
                           {advice.suggestedSl ? `Rp ${fmtInt.format(advice.suggestedSl)}` : "–"}
                         </div>
+                        {advice.suggestedSl && (
+                          <div className="text-[10px] tabular-nums text-slate-400">
+                            {fmtDec.format(advice.slRiskFromCurrentPct)}% dari close
+                          </div>
+                        )}
+                      </div>
+                      <div>
+                        <span className="text-slate-500">
+                          {advice.lockedPnlRp !== null && advice.lockedPnlRp >= 0
+                            ? "Profit Terkunci (SL)"
+                            : "Batas Risiko (SL)"}
+                        </span>
+                        {advice.lockedPnlRp !== null && advice.lockedPnlPct !== null ? (
+                          <>
+                            <div
+                              className={`mt-0.5 font-bold tabular-nums ${
+                                advice.lockedPnlRp >= 0 ? "text-emerald-600" : "text-amber-700"
+                              }`}
+                            >
+                              {advice.lockedPnlPct >= 0 ? "+" : ""}
+                              {fmtDec.format(advice.lockedPnlPct)}%
+                            </div>
+                            <div className="text-[10px] tabular-nums text-slate-500">
+                              {advice.lockedPnlRp >= 0 ? "+" : ""}Rp {fmtInt.format(advice.lockedPnlRp)}
+                            </div>
+                          </>
+                        ) : (
+                          <div className="mt-0.5 font-bold text-slate-400">–</div>
+                        )}
                       </div>
                       <div>
                         <span className="text-slate-500">Usia Pegang</span>
                         <div className="mt-0.5 font-bold tabular-nums text-slate-800">
                           {advice.holdingBars} hari bursa
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          {advice.daysToTimeStop > 0
+                            ? `Sisa ${advice.daysToTimeStop}h ke eval 20h`
+                            : "Lewat horizon 20h"}
                         </div>
                       </div>
                     </div>

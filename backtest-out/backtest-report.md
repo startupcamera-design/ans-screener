@@ -1,162 +1,90 @@
-# Laporan backtest skor ANS Screener (Scoring v2 · Anti-Sideways)
+# Laporan Audit Final Ketajaman Skor ANS Screener
 
-- Data: 468 file, 1115 ticker, 2025-06-13 s/d 2026-11-20
-- Sinyal diuji: 79236 (saham bullish, likuid ≥ Rp 500.000.000/hari), pengambilan sampel tiap 1 bar
-- Supertrend: ATR 14, multiplier 2. Entry = open hari berikutnya, biaya round-trip 0.40%
-- Train: sebelum 2026-06-24 (54879 sinyal). Test: sejak 2026-06-24 (24357 sinyal). Batas kuintil ditentukan dari TRAIN saja.
-- Horizon utama untuk analisis: 10 hari bursa.
+- **Konfigurasi Aktif:** Supertrend ATR 10, Mult 1.5 | Bobot: { proximity: 18, trendQuality: 28, trendAge: 20, pullback: 16, volume: 18 } | Penalti: Varian D
+- **Dataset:** 468 file, 1115 ticker, periode 2025-06-13 s/d 2026-11-20
+- **Populasi Uji:** 79256 sinyal bullish & likuid (≥ Rp 500.000.000/hari), sampling tiap 1 bar
+- **Pembagian Data:** TRAIN < 2026-06-24 (55561 sinyal) | TEST (Out-of-Sample) ≥ 2026-06-24 (23695 sinyal)
+- **Biaya & Horizon:** Round-trip 0.40% (entry OPEN t+1), horizon utama **10 hari bursa**
 
-> Catatan: sinyal harian saling tumpang-tindih (saham yang sama muncul berhari-hari, dan return 10 hari antar hari berdekatan berkorelasi), sehingga angka t/IC terlihat lebih meyakinkan daripada sebenarnya. Anggap hasil sebagai petunjuk, bukan bukti.
+## 1. Performa Top Pick Aplikasi (Periode TEST · Out-of-Sample)
 
-## 1. Seluruh sinyal (pembanding)
+Evaluasi langsung aturan eksekusi aplikasi (`Skor ≥ 86` dan filter risiko `SL ≤ 8%`) lintas horizon waktu:
 
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Semua sinyal, 5 hari | 78435 | -0.22% | -1.11% | 40.3% | 25.6% | -0.24% | -6.58% | 37.7% |
-| Semua sinyal, 10 hari | 77711 | 0.30% | -1.34% | 42.0% | 44.5% | 0.39% | -9.24% | 47.9% |
-| Semua sinyal, 20 hari | 76322 | 1.36% | -1.92% | 42.9% | 68.2% | 1.65% | -13.02% | 58.6% |
+| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | Profit Factor | MAE rata-rata | Capai target |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Pembanding: Semua sinyal bullish (5h) | 22712 | -1.05% | -1.08% | 40.4% | 33.6% | -1.22% | 0.66 | -6.46% | 36.7% |
+| Skor ≥ 86 tanpa filter SL (5h) | 1289 | 0.48% | -0.40% | 46.2% | 26.0% | 0.27% | 1.09 | -6.24% | 59.5% |
+| **Top Pick Aplikasi: Skor ≥ 86 & SL ≤ 8% (5h)** | 942 | 1.14% | -0.40% | 48.1% | 24.5% | 0.84% | 1.36 | -4.89% | 57.6% |
+| Pembanding: Semua sinyal bullish (10h) | 21789 | -0.62% | -0.99% | 43.4% | 54.9% | -1.04% | 0.77 | -8.94% | 47.8% |
+| Skor ≥ 86 tanpa filter SL (10h) | 1257 | 2.03% | -0.40% | 48.9% | 47.7% | 1.08% | 1.28 | -8.51% | 71.6% |
+| **Top Pick Aplikasi: Skor ≥ 86 & SL ≤ 8% (10h)** | 914 | 3.05% | 0.23% | 50.8% | 46.4% | 2.08% | 1.70 | -6.59% | 71.4% |
+| Pembanding: Semua sinyal bullish (20h) | 20330 | -0.51% | -1.13% | 45.6% | 76.9% | -0.08% | 0.98 | -12.25% | 60.2% |
+| Skor ≥ 86 tanpa filter SL (20h) | 1226 | 3.70% | -1.37% | 45.4% | 75.0% | 2.72% | 1.58 | -12.39% | 78.1% |
+| **Top Pick Aplikasi: Skor ≥ 86 & SL ≤ 8% (20h)** | 885 | 4.40% | -0.40% | 47.5% | 75.7% | 3.11% | 1.83 | -10.08% | 78.8% |
 
-## 2a. Skor per kuintil, periode TRAIN
+## 2. Gradasi Ambang Skor di Periode TEST (10 hari)
 
-**Horizon 5 hari**
+Memastikan kenaikan skor berbanding lurus dengan kualitas return dan penurunan risiko:
 
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Q1 (skor 0–40) | 11508 | -1.34% | -1.80% | 34.4% | 33.5% | -1.15% | -7.02% | 22.3% |
-| Q2 (skor 41–52) | 11355 | -0.76% | -1.45% | 37.5% | 28.3% | -0.70% | -6.83% | 33.8% |
-| Q3 (skor 53–63) | 10956 | -0.19% | -1.11% | 40.1% | 26.1% | -0.16% | -6.58% | 39.0% |
-| Q4 (skor 64–75) | 10114 | 0.62% | -1.12% | 40.8% | 24.1% | 0.60% | -6.81% | 46.2% |
-| Q5 (skor 76–100) | 10946 | 1.81% | -0.40% | 46.0% | 23.0% | 1.77% | -6.63% | 54.0% |
-| Semua | 54879 | 0.00% | -1.19% | 39.7% | 27.1% | 0.05% | -6.78% | 38.7% |
+| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | Profit Factor | MAE rata-rata | Capai target |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Skor < 57 (Hindari / Sideways) | 11933 | -1.68% | -1.33% | 41.4% | 59.3% | -1.95% | 0.60 | -9.51% | 38.4% |
+| Skor 57–70 (Cukup · Q4) | 4896 | 0.11% | -0.40% | 45.3% | 51.0% | -0.40% | 0.90 | -8.29% | 54.5% |
+| Skor 71–85 (Kuat · Q5) | 3703 | 0.94% | -0.40% | 45.7% | 48.3% | 0.32% | 1.09 | -8.10% | 61.2% |
+| Skor ≥ 86 & SL > 8% (Tunggu Pullback) | 343 | -0.68% | -1.81% | 44.0% | 51.0% | -1.59% | 0.74 | -13.62% | 72.0% |
+| **Skor ≥ 86 & SL ≤ 8% (Top Pick Siap Beli)** | 914 | 3.05% | 0.23% | 50.8% | 46.4% | 2.08% | 1.70 | -6.59% | 71.4% |
 
-**Horizon 10 hari**
+## 3. Perbandingan Kuintil TRAIN vs TEST (10 hari)
 
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Q1 (skor 0–40) | 11508 | -1.66% | -2.65% | 35.3% | 53.2% | -1.27% | -9.91% | 31.4% |
-| Q2 (skor 41–52) | 11355 | -0.99% | -2.29% | 37.8% | 49.4% | -0.53% | -9.74% | 43.2% |
-| Q3 (skor 53–63) | 10956 | 0.35% | -1.36% | 41.3% | 45.0% | 0.63% | -9.21% | 49.7% |
-| Q4 (skor 64–75) | 10114 | 1.62% | -1.28% | 42.9% | 44.8% | 1.53% | -9.54% | 56.1% |
-| Q5 (skor 76–100) | 10946 | 3.93% | -0.40% | 47.7% | 42.0% | 3.83% | -9.32% | 64.0% |
-| Semua | 54879 | 0.60% | -1.63% | 40.9% | 47.0% | 0.80% | -9.55% | 48.6% |
+Batas kuintil dikunci dari periode TRAIN untuk menguji konsistensi urutan (monotonisitas) di periode TEST:
 
-**Horizon 20 hari**
+**Periode TRAIN (10 hari)**
 
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Q1 (skor 0–40) | 11508 | -2.07% | -3.81% | 35.1% | 76.3% | -1.03% | -14.43% | 42.0% |
-| Q2 (skor 41–52) | 11355 | -0.60% | -3.23% | 38.7% | 73.8% | 0.23% | -14.10% | 53.1% |
-| Q3 (skor 53–63) | 10956 | 1.75% | -1.94% | 42.4% | 69.6% | 1.77% | -12.87% | 60.0% |
-| Q4 (skor 64–75) | 10114 | 4.31% | -1.28% | 45.2% | 69.3% | 3.18% | -12.88% | 66.3% |
-| Q5 (skor 76–100) | 10946 | 8.11% | 0.19% | 50.8% | 66.4% | 7.06% | -12.48% | 73.0% |
-| Semua | 54879 | 2.20% | -2.07% | 42.3% | 71.2% | 2.18% | -13.38% | 58.5% |
+| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | Profit Factor | MAE rata-rata | Capai target |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q1 (skor 0–39) | 11932 | -1.28% | -2.22% | 37.4% | 62.2% | -0.83% | 0.81 | -9.77% | 28.6% |
+| Q2 (skor 40–49) | 10693 | -0.86% | -2.09% | 38.1% | 59.8% | -0.42% | 0.90 | -9.45% | 41.4% |
+| Q3 (skor 50–59) | 10974 | -0.35% | -1.99% | 38.4% | 59.6% | -0.02% | 0.99 | -9.61% | 51.2% |
+| Q4 (skor 60–73) | 11502 | 1.38% | -1.39% | 41.7% | 58.0% | 1.37% | 1.32 | -9.48% | 57.3% |
+| Q5 (skor 74–100) | 10460 | 3.78% | -0.40% | 47.9% | 52.8% | 3.64% | 1.91 | -9.04% | 68.4% |
+| Semua sinyal | 55561 | 0.49% | -1.65% | 40.6% | 58.6% | 0.70% | 1.16 | -9.48% | 49.0% |
 
-## 2b. Skor per kuintil, periode TEST
+**Periode TEST (10 hari)**
 
-**Horizon 5 hari**
+| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | Profit Factor | MAE rata-rata | Capai target |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q1 (skor 0–39) | 4977 | -2.48% | -2.00% | 38.8% | 63.3% | -2.53% | 0.53 | -10.59% | 29.9% |
+| Q2 (skor 40–49) | 4013 | -1.36% | -1.18% | 42.4% | 58.1% | -1.80% | 0.62 | -9.10% | 41.1% |
+| Q3 (skor 50–59) | 4130 | -0.62% | -0.75% | 44.4% | 53.6% | -1.04% | 0.75 | -8.26% | 49.9% |
+| Q4 (skor 60–73) | 4648 | 0.45% | -0.40% | 46.0% | 49.8% | -0.13% | 0.97 | -8.22% | 57.2% |
+| Q5 (skor 74–100) | 4021 | 1.20% | -0.40% | 46.3% | 48.5% | 0.51% | 1.13 | -8.27% | 63.7% |
+| Semua sinyal | 21789 | -0.62% | -0.99% | 43.4% | 54.9% | -1.04% | 0.77 | -8.94% | 47.8% |
 
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Q1 (skor 0–40) | 5368 | -1.29% | -0.81% | 42.3% | 27.5% | -1.37% | -6.56% | 23.6% |
-| Q2 (skor 41–52) | 5173 | -1.01% | -0.80% | 42.4% | 22.9% | -1.16% | -5.90% | 29.0% |
-| Q3 (skor 53–63) | 4490 | -0.93% | -1.17% | 39.6% | 22.0% | -1.05% | -5.91% | 34.6% |
-| Q4 (skor 64–75) | 4300 | -0.37% | -0.88% | 40.8% | 19.6% | -0.56% | -6.02% | 45.5% |
-| Q5 (skor 76–100) | 4225 | 0.08% | -0.69% | 43.2% | 17.6% | -0.16% | -6.11% | 48.5% |
-| Semua | 23556 | -0.75% | -0.86% | 41.7% | 22.2% | -0.90% | -6.11% | 35.3% |
+## 4. Daya Prediksi Tiap Faktor Aktif (Spearman IC · 10 hari)
 
-**Horizon 10 hari**
-
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Q1 (skor 0–40) | 5110 | -1.45% | -0.85% | 43.7% | 43.6% | -1.48% | -9.16% | 34.8% |
-| Q2 (skor 41–52) | 4943 | -0.74% | -0.40% | 45.5% | 37.2% | -0.75% | -8.12% | 39.9% |
-| Q3 (skor 53–63) | 4381 | -0.39% | -0.80% | 44.7% | 37.8% | -0.47% | -8.15% | 45.5% |
-| Q4 (skor 64–75) | 4210 | 0.05% | -0.92% | 43.7% | 37.3% | -0.28% | -8.38% | 55.3% |
-| Q5 (skor 76–100) | 4188 | 0.70% | -0.76% | 45.1% | 35.8% | 0.24% | -8.53% | 60.1% |
-| Semua | 22832 | -0.42% | -0.75% | 44.5% | 38.5% | -0.59% | -8.48% | 46.4% |
-
-**Horizon 20 hari**
-
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Q1 (skor 0–40) | 4577 | -1.06% | -0.40% | 48.0% | 59.7% | 0.13% | -12.18% | 49.4% |
-| Q2 (skor 41–52) | 4434 | -0.18% | -0.40% | 48.2% | 55.5% | 1.02% | -11.42% | 56.9% |
-| Q3 (skor 53–63) | 4173 | -1.27% | -1.67% | 43.9% | 60.5% | 0.19% | -12.06% | 57.7% |
-| Q4 (skor 64–75) | 4113 | -1.10% | -2.56% | 41.1% | 62.0% | -0.13% | -12.29% | 64.1% |
-| Q5 (skor 76–100) | 4146 | -0.31% | -2.75% | 40.4% | 65.4% | 0.22% | -12.66% | 67.6% |
-| Semua | 21443 | -0.78% | -1.48% | 44.4% | 60.5% | 0.29% | -12.11% | 58.9% |
-
-## 3. Ambang tetap aplikasi & Top Pick (periode TEST, 10 hari)
-
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Skor ≥ 60 | 10052 | 0.18% | -0.94% | 44.0% | 36.7% | -0.14% | -8.42% | 56.0% |
-| Skor ≥ 70 | 6229 | 0.67% | -0.71% | 45.0% | 36.1% | 0.26% | -8.42% | 59.4% |
-| Skor ≥ 78 | 3556 | 0.68% | -0.87% | 45.0% | 35.8% | 0.24% | -8.59% | 61.0% |
-| Skor ≥ 86 | 1535 | 1.45% | -0.40% | 47.7% | 34.9% | 0.96% | -8.73% | 66.6% |
-| **Top Pick Aplikasi (Skor ≥ 86 & SL ≤ 8%)** | 800 | 1.26% | -0.40% | 48.4% | 35.5% | 1.04% | -6.14% | 64.9% |
-
-## 4. Daya prediksi tiap faktor (Spearman IC terhadap return 10 hari)
-
-IC = korelasi peringkat antar saham pada hari yang sama, dirata-ratakan lintas hari. **t\*** = t dibagi akar(horizon) untuk mengoreksi return yang tumpang-tindih. Faktor layak dipercaya bila tanda IC sama di TRAIN dan TEST, |IC| > 0,02, dan |t\*| > 2 di keduanya.
-
-| Faktor | Bobot | IC train | t* | IC test | t* | Konsisten? |
+| Faktor | Bobot | IC Train | t* Train | IC Test | t* Test | Status |
 |---|---:|---:|---:|---:|---:|---|
-| Kedekatan ke garis | 16 | 0.020 | 1.1 | 0.021 | 0.8 | tidak |
-| Risk/reward | 0 | -0.024 | -1.0 | -0.024 | -0.6 | tidak |
-| Kualitas tren | 34 | 0.040 | 2.1 | 0.047 | 1.5 | tidak |
-| Umur tren | 20 | 0.016 | 0.8 | 0.052 | 1.7 | tidak |
-| Kedalaman koreksi | 12 | 0.025 | 1.0 | 0.029 | 0.7 | tidak |
-| Volume mengering | 18 | 0.046 | 2.2 | 0.055 | 1.4 | tidak |
-| Pola candle bullish | 0 | 0.005 | 0.3 | 0.003 | 0.1 | tidak |
-| Kekuatan relatif | 0 | -0.011 | -0.4 | -0.048 | -1.1 | tidak |
-| *Metrik baru: Frekuensi Flip 60h* | – | -0.060 | -2.7 | -0.045 | -1.8 | (negatif = whipsaw buruk) |
-| *Metrik baru: Efficiency Ratio 30h* | – | 0.005 | 0.3 | 0.082 | 2.3 | (positif = tren lurus unggul) |
-| **Skor total (setelah penalti)** | 100 | 0.064 | 3.1 | 0.069 | 2.0 | |
+| Kedekatan ke garis | 18 | 0.025 | 1.3 | 0.035 | 1.1 | Positif konsisten |
+| Kualitas tren | 28 | 0.046 | 2.4 | 0.045 | 1.3 | Positif konsisten |
+| Umur tren | 20 | 0.041 | 2.1 | 0.067 | 1.9 | Positif konsisten |
+| Kedalaman koreksi | 16 | 0.028 | 1.1 | 0.041 | 1.0 | Positif konsisten |
+| Volume mengering | 18 | 0.048 | 2.3 | 0.049 | 1.3 | Positif konsisten |
+| **Skor Total Final (setelah penalti)** | **100** | **0.073** | **3.6** | **0.077** | **2.0** | **Unggul** |
 
-## 5. Faktor tinggi vs rendah & Uji Filter Anti-Sideways (seluruh data, 10 hari)
+## 5. Efektivitas Filter Anti-Sideways & Rezim IHSG (10 hari)
 
-Tinggi = fraksi faktor ≥ 0,67 (untuk pola candle: ada pola). Rendah = ≤ 0,33 (pola candle: tidak ada).
+| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | Profit Factor | MAE rata-rata | Capai target |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Struktur tren bersih (tanpa penalti) | 16364 | 2.65% | -0.40% | 46.3% | 54.7% | 2.32% | 1.54 | -9.62% | 60.6% |
+| Terkena penalti (sideways / < EMA50 / ret60≤0) | 60986 | -0.48% | -1.63% | 40.1% | 58.3% | -0.35% | 0.92 | -9.25% | 45.4% |
+| IHSG Bullish — Semua sinyal | 52999 | 0.14% | -1.77% | 39.4% | 58.8% | 0.21% | 1.05 | -9.20% | 50.5% |
+| IHSG Bullish — Top Pick (≥86 & SL≤8%) | 2388 | 4.90% | 0.11% | 50.8% | 52.0% | 4.54% | 2.56 | -7.06% | 73.7% |
+| IHSG Bearish — Semua sinyal | 24351 | 0.26% | -0.40% | 45.7% | 54.8% | 0.22% | 1.05 | -9.59% | 44.7% |
+| IHSG Bearish — Top Pick (≥86 & SL≤8%) | 1052 | 4.69% | 0.66% | 53.4% | 46.7% | 4.36% | 2.36 | -7.52% | 70.2% |
 
-| Faktor | n tinggi | Rata-rata tinggi | Stop tinggi | n rendah | Rata-rata rendah | Stop rendah | Selisih |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Kedekatan ke garis | 67853 | 0.45% | 41% | 5232 | -1.01% | 74% | 1.46% |
-| Risk/reward | 24552 | -0.65% | 58% | 35345 | 1.12% | 38% | -1.77% |
-| Kualitas tren | 37196 | 1.64% | 44% | 7027 | -1.38% | 46% | 3.02% |
-| Umur tren | 52787 | 0.46% | 45% | 3985 | -1.41% | 41% | 1.87% |
-| Kedalaman koreksi | 28799 | 1.29% | 41% | 35096 | -0.52% | 48% | 1.81% |
-| Volume mengering | 35243 | 0.78% | 43% | 31464 | -0.08% | 47% | 0.87% |
-| Pola candle bullish | 10787 | -0.26% | 46% | 66924 | 0.39% | 44% | -0.65% |
-| Kekuatan relatif | 37289 | 0.70% | 46% | 16027 | -0.51% | 45% | 1.20% |
+## 6. Kesimpulan Audit Final
 
-### 5b. Dampak Filter Anti-Sideways (seluruh data, 10 hari)
-
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Struktur tren bersih (tanpa penalti) | 22818 | 2.18% | -0.96% | 45.1% | 43.9% | 1.99% | -9.77% | 59.7% |
-| Terkena penalti (sideways / < EMA50 / ret60≤0) | 54893 | -0.48% | -1.49% | 40.7% | 44.7% | -0.28% | -9.01% | 43.0% |
-| Tren mulus (flips60 ≤ 2) | 38073 | 0.83% | -0.96% | 43.8% | 42.6% | 0.69% | -8.53% | 49.1% |
-| Pasar choppy/whipsaw (flips60 ≥ 4) | 20391 | -0.42% | -1.89% | 40.3% | 48.0% | -0.08% | -10.35% | 48.4% |
-| Efficiency Ratio tinggi (er30 ≥ 0.35) | 15508 | 2.50% | -0.40% | 47.3% | 47.2% | 2.34% | -11.34% | 65.2% |
-| Efficiency Ratio rendah / sideways (er30 < 0.18) | 37791 | -0.54% | -1.44% | 40.4% | 43.9% | -0.31% | -8.35% | 41.4% |
-
-## 6. Rezim IHSG saat sinyal (10 hari)
-
-Rezim = arah Supertrend COMPOSITE.JK (parameter sama) pada tanggal sinyal. Kolom kedua = hanya skor di kuintil teratas (batas dari train).
-
-| Kelompok | n | Rata-rata | Median | Menang | Kena stop | Rata-rata (dgn stop) | MAE rata-rata | Capai target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| IHSG bullish — semua sinyal | 56236 | 0.48% | -1.49% | 40.7% | 44.7% | 0.53% | -8.96% | 49.6% |
-| IHSG bullish — kuintil teratas | 11502 | 3.01% | -0.70% | 46.1% | 40.9% | 2.93% | -8.94% | 63.5% |
-| IHSG bearish — semua sinyal | 21475 | -0.17% | -0.85% | 45.2% | 43.9% | 0.03% | -9.95% | 43.4% |
-| IHSG bearish — kuintil teratas | 3632 | 3.12% | -0.07% | 49.6% | 38.3% | 2.54% | -9.64% | 61.1% |
-
-## Ringkasan
-
-- Selisih kuintil teratas − terendah (10 hari): train 5.59%, test 2.15%.
-- Kuintil teratas vs seluruh sinyal di periode test: 1.12% (n=4188).
-- Top Pick Aplikasi (Skor ≥ 86 & SL ≤ 8%) di periode test: rata-rata 1.26%, kena stop 36% (n=800).
-- Kuintil teratas: kena stop 36% vs 39% untuk seluruh sinyal (periode test).
-- **Kesimpulan awal:** Skor tinggi lebih baik daripada skor rendah di train DAN test. Itu pertanda baik, tetapi belum bukti: periksa tabel IC per faktor dan rezim IHSG sebelum menyetel bobot.
-
-Keterbatasan: tidak memodelkan batas ARA/ARB, antrean order, slippage pada saham tidak likuid, atau corporate action (split) pada data. Return 'dengan stop' keluar di open setelah Supertrend berbalik, sehingga bisa lebih buruk bila terjadi gap.
+- **Spread Q5 − Q1 (10 hari):** TRAIN **5.06%** | TEST **3.68%**.
+- **Keunggulan Top Pick Aplikasi (Skor ≥ 86 & SL ≤ 8%) di TEST:** rata-rata **3.05%** (dengan stop: **2.08%**, Profit Factor **1.70**) vs **-0.62%** untuk rata-rata pasar bullish.
+- **Kontrol Risiko:** Win rate **50.8%**, kena stop **46.4%**, dan MAE rata-rata terjaga di **-6.59%** (dari 914 sinyal uji).
+- **Information Coefficient (IC) Skor Total:** TRAIN **0.073** → TEST **0.077** (stabil dan tidak mengalami degradasi out-of-sample).

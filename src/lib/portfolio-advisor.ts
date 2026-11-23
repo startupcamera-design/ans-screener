@@ -73,13 +73,18 @@ export type PositionAdvice = {
   detail: string;
   suggestedSl: number | null;
   holdingBars: number;
+  daysToTimeStop: number; // sisa hari bursa menuju evaluasi 20 hari (0 jika sudah >= 20)
   currentPrice: number;
+  netBreakevenPrice: number; // harga jual minimal agar impas setelah fee ~0.40%
   stLine: number;
   pnlRp: number;
   pnlPct: number;
   marketValue: number;
   slRiskFromCurrentPct: number;
+  lockedPnlRp: number | null; // estimasi P/L bersih jika SL aktif (terpasang/disarankan) tersentuh
+  lockedPnlPct: number | null; // % P/L terkunci pada SL aktif terhadap harga beli
   isBreakevenOrBetter: boolean;
+  currentSetupScore: number | null; // skor screener terbaru (0-100) jika tersedia
   addOnReady: boolean;
   addOnSuggestedLots: number;
 };
@@ -107,6 +112,13 @@ export function floorToIdxTick(price: number, subtractTicks = 0): number {
     }
   }
   return Math.max(1, p);
+}
+
+/** Bulatkan harga ke fraksi BEI sah terdekat ke atas (untuk harga impas / target) */
+export function ceilToIdxTick(price: number): number {
+  if (price <= 0) return 0;
+  const tick = getIdxTick(price);
+  return Math.ceil(price / tick) * tick;
 }
 
 /** Pengaturan Modal, Manajemen Risiko & Batas Slot Portofolio (disimpan di localStorage) */
@@ -244,6 +256,7 @@ function computeHealthScore(params: {
   strongBreakoutBar: boolean;
   distAtr: number;
   installedSlRiskFromBuyPct: number | null;
+  currentSetupScore: number | null;
 }): {
   score: number;
   label: string;
@@ -263,6 +276,7 @@ function computeHealthScore(params: {
     strongBreakoutBar,
     distAtr,
     installedSlRiskFromBuyPct,
+    currentSetupScore,
   } = params;
 
   const reasons: HealthFactor[] = [];
@@ -321,7 +335,26 @@ function computeHealthScore(params: {
     });
   }
 
-  // 3. Pengaruh momentum harian terbaru
+  // 3. Pengaruh skor setup screener terbaru (jika tersedia)
+  if (currentSetupScore !== null) {
+    if (currentSetupScore >= 86) {
+      score += 6;
+      reasons.push({
+        label: `Skor Screener Elite (${currentSetupScore}/100)`,
+        delta: 6,
+        detail: "Struktur teknikal saat ini masih masuk peringkat Top Pick bursa.",
+      });
+    } else if (currentSetupScore < 57) {
+      score -= 12;
+      reasons.push({
+        label: `Skor Screener Melemah (${currentSetupScore}/100)`,
+        delta: -12,
+        detail: "Struktur harga mulai memasuki fase sideways atau kehilangan momentum.",
+      });
+    }
+  }
+
+  // 4. Pengaruh momentum harian terbaru
   if (strongBreakoutBar) {
     score += 7;
     reasons.push({
@@ -338,13 +371,13 @@ function computeHealthScore(params: {
     });
   }
 
-  // 4. Penalti waktu pegang jika stagnan (time decay)
+  // 5. Penalti waktu pegang jika stagnan (time decay)
   if (holdingBars >= 20 && pnlPct < 4) {
     score -= 28;
     reasons.push({
       label: `Stagnan ≥ 20 Hari Bursa (${holdingBars}h)`,
       delta: -28,
-      detail: "Melewati batas horizon optimal backtest (10–20 hari) tanpa kenaikan berarti.",
+      detail: "Melewati batas horizon optimal audit (10–20 hari) tanpa kenaikan berarti.",
     });
   } else if (holdingBars >= 13 && pnlPct <= 1.5) {
     score -= 16;
@@ -368,7 +401,7 @@ function computeHealthScore(params: {
     });
   }
 
-  // 5. Penalti kondisi teknikal & disiplin SL
+  // 6. Penalti kondisi teknikal & disiplin SL
   if (intradayTouchedSl) {
     score -= 25;
     reasons.push({
@@ -447,6 +480,7 @@ export type EvaluatePositionContext = {
   ihsgBullish?: boolean | null;
   prefs?: TradingPrefs;
   sameTickerPositions?: PositionRow[];
+  currentSetupScore?: number | null;
 };
 
 /**
@@ -464,6 +498,7 @@ export function evaluatePosition(
   const ihsgBullish = ctx?.ihsgBullish ?? null;
   const prefs = ctx?.prefs ?? DEFAULT_TRADING_PREFS;
   const sameTickerCount = ctx?.sameTickerPositions?.length ?? 1;
+  const currentSetupScore = ctx?.currentSetupScore ?? null;
 
   const lastBar = bars[bars.length - 1];
   const prevBar = bars.length >= 2 ? bars[bars.length - 2] : null;
@@ -473,21 +508,37 @@ export function evaluatePosition(
     prevBar && prevBar.close > 0 ? ((currentPrice - prevBar.close) / prevBar.close) * 100 : 0;
 
   const holdingBars = Math.max(1, bars.filter((b) => b.date >= pos.buy_date).length);
+  const daysToTimeStop = Math.max(0, 20 - holdingBars);
 
   const shares = pos.lots * 100;
   const costBasis = pos.buy_price * shares;
   const marketValue = currentPrice * shares;
   const pnlRp = marketValue - costBasis;
   const pnlPct = costBasis > 0 ? ((currentPrice - pos.buy_price) / pos.buy_price) * 100 : 0;
+  const netBreakevenPrice = ceilToIdxTick(pos.buy_price * 1.004); // kompensasi fee beli + jual ~0.40%
 
   const isBullish = lastSt.trend === 1;
   const stLine = isBullish ? lastSt.up : lastSt.dn;
   const suggestedSl = isBullish ? floorToIdxTick(lastSt.up, 1) : null;
   const slRiskFromCurrentPct =
     suggestedSl && currentPrice > 0 ? ((suggestedSl - currentPrice) / currentPrice) * 100 : 0;
+
+  // Hitung P/L terkunci berdasarkan SL tertinggi yang relevan (terpasang vs disarankan)
+  const referenceSl =
+    pos.sl_installed !== null && suggestedSl !== null
+      ? Math.max(pos.sl_installed, suggestedSl)
+      : pos.sl_installed ?? suggestedSl;
+  const lockedPnlRp =
+    referenceSl !== null && shares > 0 ? (referenceSl - pos.buy_price) * shares : null;
+  const lockedPnlPct =
+    referenceSl !== null && pos.buy_price > 0
+      ? ((referenceSl - pos.buy_price) / pos.buy_price) * 100
+      : null;
+
   const isBreakevenOrBetter =
-    (suggestedSl !== null && suggestedSl >= pos.buy_price) ||
-    (pos.sl_installed !== null && pos.sl_installed >= pos.buy_price);
+    (suggestedSl !== null && suggestedSl >= netBreakevenPrice) ||
+    (pos.sl_installed !== null && pos.sl_installed >= netBreakevenPrice);
+
   const installedSlRiskFromBuyPct =
     pos.sl_installed !== null && pos.buy_price > 0
       ? ((pos.sl_installed - pos.buy_price) / pos.buy_price) * 100
@@ -522,11 +573,13 @@ export function evaluatePosition(
     lastBar.low <= pos.sl_installed &&
     currentPrice > pos.sl_installed;
 
-  // Hitung kesiapan Add-On (Pyramiding)
+  // Hitung kesiapan Add-On (Pyramiding) — syarat diperketat dengan skor setup terbaru >= 80
+  const scoreAllowsAddOn = currentSetupScore === null || currentSetupScore >= 80;
   const addOnReady =
     isBullish &&
     !closeBreachedSl &&
     !intradayTouchedSl &&
+    scoreAllowsAddOn &&
     sameTickerCount === 1 &&
     ihsgBullish !== false &&
     isBreakevenOrBetter &&
@@ -561,6 +614,7 @@ export function evaluatePosition(
     strongBreakoutBar,
     distAtr,
     installedSlRiskFromBuyPct,
+    currentSetupScore,
   });
 
   const last3Bars = bars.slice(-3);
@@ -577,13 +631,18 @@ export function evaluatePosition(
     cardTintCls: health.cardTintCls,
     healthReasons: health.reasons,
     holdingBars,
+    daysToTimeStop,
     currentPrice,
+    netBreakevenPrice,
     stLine,
     pnlRp,
     pnlPct,
     marketValue,
     slRiskFromCurrentPct,
+    lockedPnlRp,
+    lockedPnlPct,
     isBreakevenOrBetter,
+    currentSetupScore,
     addOnReady: addOnReady && addOnSuggestedLots > 0,
     addOnSuggestedLots,
   };
@@ -739,20 +798,29 @@ export function evaluatePosition(
     };
   }
 
-  // 9. PRIORITAS KESEMBILAN: Peringatan dini stagnan (hari ke-13 s/d 19) atau volume distribusi
-  if (heavyDistribution || (holdingBars >= 13 && pnlPct <= 1.5)) {
+  // 9. PRIORITAS KESEMBILAN: Peringatan dini stagnan (hari ke-13 s/d 19), volume distribusi, atau skor turun drastis
+  const scoreDegraded = currentSetupScore !== null && currentSetupScore < 57;
+  if (heavyDistribution || (holdingBars >= 13 && pnlPct <= 1.5) || scoreDegraded) {
     return {
       ...base,
       code: "WATCH_MOMENTUM",
-      badge: heavyDistribution ? "WASPADA DISTRIBUSI" : `PANTAU KETAT · H-${holdingBars}`,
+      badge: heavyDistribution
+        ? "WASPADA DISTRIBUSI"
+        : scoreDegraded
+        ? `WASPADA SIDEWAYS · Skor ${currentSetupScore}`
+        : `PANTAU KETAT · H-${holdingBars}`,
       badgeCls: "bg-amber-500 text-white",
       borderCls: "border-amber-300",
       headline: heavyDistribution
         ? `Muncul candle merah dengan lonjakan volume (>2x rata-rata). Pastikan auto-SL aktif di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`
-        : `Sudah ${holdingBars} hari bursa dan harga masih jalan di tempat (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%).`,
+        : scoreDegraded
+        ? `Skor struktur tren saham ini turun ke ${currentSetupScore}/100 (terdeteksi sideways). Kawal ketat SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`
+        : `Sudah ${holdingBars} hari bursa (sisa ${daysToTimeStop} hari evaluasi) dan harga masih jalan di tempat (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%).`,
       detail: heavyDistribution
         ? `Terjadi tekanan jual besar hari ini. Jangan menambah posisi; biarkan garis SL Supertrend menjaga batas kerugian Anda.`
-        : `Mendekati batas evaluasi 20 hari bursa. Jika dalam 3–5 hari ke depan belum mampu menembus naik, bersiaplah melakukan rotasi modal.`,
+        : scoreDegraded
+        ? `Meskipun belum menyentuh garis Supertrend, indikator kualitas tren mulai melemah. Jangan menambah lot baru pada posisi ini.`
+        : `Mendekati batas evaluasi 20 hari bursa. Jika belum mampu menembus naik, bersiaplah melakukan rotasi modal.`,
       suggestedSl,
     };
   }
@@ -782,8 +850,8 @@ export function evaluatePosition(
       badge: "SIAP ADD-ON · Zero Risk",
       badgeCls: "bg-sky-700 text-white",
       borderCls: "border-sky-300",
-      headline: `Modal awal sudah aman (SL di atas harga beli) & tren menguat (+${pnlPct.toFixed(1)}%, jarak ${distAtr.toFixed(1)} ATR).`,
-      detail: `Jika slot portofolio masih tersedia dan skor screener emiten ini masih ≥ 86, posisi ini memenuhi syarat untuk pyramiding (+${addOnSuggestedLots} lot) dengan batas SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
+      headline: `Modal awal sudah aman (SL di atas harga impas) & tren menguat (+${pnlPct.toFixed(1)}%, jarak ${distAtr.toFixed(1)} ATR).`,
+      detail: `Jika slot portofolio masih tersedia, posisi ini memenuhi syarat untuk pyramiding (+${addOnSuggestedLots} lot) dengan batas SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
       suggestedSl,
     };
   }
@@ -797,7 +865,7 @@ export function evaluatePosition(
       badgeCls: "bg-slate-800 text-white",
       borderCls: "border-emerald-200",
       headline: `Fase awal swing (hari ke-${holdingBars}). Biarkan harga bernapas dengan SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
-      detail: `Pada 1–3 hari pertama setelah beli, wajar jika harga menguji area breakout atau bergerak di sekitar harga beli (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%). Fokus utama hanya memastikan auto-SL sudah aktif di sekuritas.`,
+      detail: `Pada 1–3 hari pertama setelah beli, wajar jika harga menguji area breakout atau bergerak di sekitar harga impas (${fmtRp(netBreakevenPrice)}). Fokus utama hanya memastikan auto-SL sudah aktif di sekuritas.`,
       suggestedSl,
     };
   }
@@ -810,7 +878,7 @@ export function evaluatePosition(
     badgeCls: "bg-slate-800 text-white",
     borderCls: "border-emerald-200",
     headline: `Pertahankan posisi & biarkan auto-SL aktif di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
-    detail: `Tren masih Bullish sehat (usia pegang ${holdingBars} dari target 10–20 hari bursa, jarak ${distAtr.toFixed(1)} ATR di atas garis ST). Belum perlu mengubah order di sekuritas.`,
+    detail: `Tren masih Bullish sehat (hari ke-${holdingBars}, sisa ${daysToTimeStop} hari menuju evaluasi 20h, jarak ${distAtr.toFixed(1)} ATR di atas garis ST).`,
     suggestedSl,
   };
 }
