@@ -11,7 +11,14 @@ import { detectBullishPatterns } from "@/lib/candles";
 import { toWeekly } from "@/lib/timeframe";
 import { metricsFromDb, VBar } from "@/lib/metrics";
 import { percentileMap, scoreMetrics } from "@/lib/scoring";
-import { floorToIdxTick, type PositionRow } from "@/lib/portfolio-advisor";
+import {
+  computePositionSizing,
+  DEFAULT_TRADING_PREFS,
+  floorToIdxTick,
+  loadTradingPrefs,
+  type PositionRow,
+  type TradingPrefs,
+} from "@/lib/portfolio-advisor";
 import ScoreBreakdown from "./ScoreBreakdown";
 
 const GREEN = "#059669";
@@ -27,6 +34,8 @@ export default function StockChart({ ticker }: { ticker: string }) {
   const [daily, setDaily] = useState<VBar[]>([]);
   const [row, setRow] = useState<any>(null);
   const [rs, setRs] = useState<number | null>(null);
+  const [ihsgBullish, setIhsgBullish] = useState<boolean | null>(null);
+  const [prefs, setPrefs] = useState<TradingPrefs>(DEFAULT_TRADING_PREFS);
   const [openPos, setOpenPos] = useState<PositionRow[]>([]);
   const [stale, setStale] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -42,6 +51,10 @@ export default function StockChart({ ticker }: { ticker: string }) {
   const isIndex = ticker === INDEX_TICKER;
 
   useEffect(() => {
+    setPrefs(loadTradingPrefs());
+  }, []);
+
+  useEffect(() => {
     (async () => {
       try {
         const db = supabaseBrowser();
@@ -54,7 +67,7 @@ export default function StockChart({ ticker }: { ticker: string }) {
             .limit(700),
           db.from("screener_latest").select("*").eq("ticker", ticker).maybeSingle(),
           fetchAll<any>((from, to) =>
-            db.from("screener_latest").select("ticker,date,ret60").range(from, to)
+            db.from("screener_latest").select("ticker,date,ret60,trend").range(from, to)
           ),
           isIndex
             ? Promise.resolve({ data: [], error: null })
@@ -93,8 +106,14 @@ export default function StockChart({ ticker }: { ticker: string }) {
               status: d.status,
               sell_date: d.sell_date ?? null,
               sell_price: d.sell_price === null ? null : Number(d.sell_price),
+              exit_reason: d.exit_reason ?? null,
             }))
           );
+        }
+
+        const idxRow = all.find((x) => x.ticker === INDEX_TICKER);
+        if (idxRow && idxRow.trend !== null && idxRow.trend !== undefined) {
+          setIhsgBullish(Number(idxRow.trend) === 1);
         }
 
         const list = all.filter((x) => x.ticker !== INDEX_TICKER);
@@ -123,7 +142,7 @@ export default function StockChart({ ticker }: { ticker: string }) {
   const metrics = useMemo(() => (isIndex || stale ? null : metricsFromDb(row)), [row, isIndex, stale]);
   const result = useMemo(() => (metrics ? scoreMetrics(metrics, rs) : null), [metrics, rs]);
 
-  // Kalkulasi rencana eksekusi EOD (selaras 100% dengan fraksi BEI di Screener & PortfolioAdvisor)
+  // Kalkulasi rencana eksekusi EOD + Position Sizing otomatis (selaras dengan Screener & PortfolioAdvisor)
   const tradePlan = useMemo(() => {
     if (isIndex || daily.length === 0 || dailySt.length === 0) return null;
     const lastBar = daily[daily.length - 1];
@@ -134,6 +153,17 @@ export default function StockChart({ ticker }: { ticker: string }) {
     const slRiskPct =
       orderSl !== null && lastBar.close > 0 ? ((orderSl - lastBar.close) / lastBar.close) * 100 : null;
     const maxBuyLimit = floorToIdxTick(lastBar.close * 1.015, 0);
+
+    const sizing =
+      bullish && orderSl !== null
+        ? computePositionSizing({
+            entryPrice: lastBar.close,
+            stopLossPrice: orderSl,
+            prefs,
+            ihsgBullish,
+          })
+        : null;
+
     return {
       bullish,
       close: lastBar.close,
@@ -142,8 +172,9 @@ export default function StockChart({ ticker }: { ticker: string }) {
       slRiskPct,
       maxBuyLimit,
       safeRisk: slRiskPct !== null && slRiskPct >= -8,
+      sizing,
     };
-  }, [isIndex, daily, dailySt]);
+  }, [isIndex, daily, dailySt, prefs, ihsgBullish]);
 
   // Ringkasan posisi aktif jika saham ini sudah ada di Portofolio
   const heldSummary = useMemo(() => {
@@ -289,11 +320,20 @@ export default function StockChart({ ticker }: { ticker: string }) {
     if (!tradePlan || !tradePlan.bullish || tradePlan.orderSl === null) return;
     const clean = ticker.replace(/\.JK$/, "");
     const scoreTxt = result ? ` · Skor ${result.total}` : "";
+    const sizingLines =
+      tradePlan.sizing && tradePlan.sizing.lots > 0
+        ? [
+            `- Lot Ideal  : ${tradePlan.sizing.lots} Lot (~Rp ${fmtInt.format(tradePlan.sizing.estimatedCostRp)} / ${tradePlan.sizing.allocationPct.toFixed(1)}% modal)`,
+            `- Risiko SL  : ~Rp ${fmtInt.format(tradePlan.sizing.actualRiskRp)} (${ihsgBullish === false ? "Porsi 50% IHSG Bearish" : "Porsi 100%"})`,
+          ]
+        : [];
+
     const text = [
       `PLAN EOD [${clean}]${scoreTxt}`,
       `- Close      : Rp ${fmtInt.format(tradePlan.close)}`,
       `- Beli Maks  : Rp ${fmtInt.format(tradePlan.maxBuyLimit)} (+1,5%)`,
       `- Order SL   : Rp ${fmtInt.format(tradePlan.orderSl)} (${tradePlan.slRiskPct?.toFixed(1)}%)`,
+      ...sizingLines,
     ].join("\n");
     navigator.clipboard?.writeText(text);
     setCopied(true);
@@ -420,7 +460,7 @@ export default function StockChart({ ticker }: { ticker: string }) {
             </div>
           )}
 
-          {/* Panduan Order EOD */}
+          {/* Panduan Order EOD + Kalkulator Position Sizing */}
           {!isIndex && tradePlan && (
             <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm">
               <div className="flex items-center justify-between">
@@ -461,6 +501,40 @@ export default function StockChart({ ticker }: { ticker: string }) {
                         {tradePlan.slRiskPct === null ? "–" : `${tradePlan.slRiskPct.toFixed(1)}%`} (maks ideal -8%)
                       </dd>
                     </div>
+
+                    {/* Position Sizing Otomatis */}
+                    {tradePlan.sizing && (
+                      <div className="rounded-xl border border-slate-100 bg-slate-50/80 p-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-slate-700">Position Sizing Otomatis</span>
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                              ihsgBullish === false
+                                ? "bg-rose-100 text-rose-700"
+                                : "bg-emerald-100 text-emerald-800"
+                            }`}
+                          >
+                            {ihsgBullish === false ? "IHSG Bearish · 50%" : "IHSG Bullish · 100%"}
+                          </span>
+                        </div>
+                        <div className="mt-2 flex items-baseline justify-between">
+                          <span className="text-slate-500">Lot Ideal</span>
+                          <span className="text-sm font-bold tabular-nums text-slate-900">
+                            {tradePlan.sizing.lots} Lot{" "}
+                            <span className="text-xs font-normal text-slate-500">
+                              (~Rp {fmtInt.format(tradePlan.sizing.estimatedCostRp)})
+                            </span>
+                          </span>
+                        </div>
+                        <div className="mt-1 flex justify-between text-[11px] text-slate-500">
+                          <span>Alokasi: {tradePlan.sizing.allocationPct.toFixed(1)}% modal</span>
+                          <span>
+                            Risiko SL: <b className="text-slate-700">Rp {fmtInt.format(tradePlan.sizing.actualRiskRp)}</b>
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
                     {metrics && (
                       <div className="flex justify-between border-t border-slate-100 pt-2">
                         <dt className="text-slate-500">Likuiditas (rata2 20h)</dt>

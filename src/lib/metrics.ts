@@ -21,6 +21,8 @@ export type Metrics = {
   patternAge: number | null; // 0 = bar terakhir
   stLine: number | null; // harga garis Supertrend (garis SL)
   slRiskPct: number | null; // % jarak dari close ke garis SL (negatif saat bullish, mis. -4.5)
+  flips60?: number | null; // jumlah perubahan tren BUY/SELL dalam 60 bar terakhir (deteksi sideways/whipsaw)
+  er30?: number | null; // Kaufman Efficiency Ratio 30 bar (0..1; makin tinggi makin lurus trennya)
 };
 
 const avg = (a: number[]) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
@@ -67,6 +69,17 @@ export function adxAt(bars: Bar[], end: number, n = 14): number | null {
   return adx;
 }
 
+// Kaufman Efficiency Ratio (N bar): rasio jarak bersih terhadap total panjang gerak harian
+function efficiencyRatioAt(closes: number[], end: number, n = 30): number | null {
+  if (end < n) return null;
+  const netMove = Math.abs(closes[end] - closes[end - n]);
+  let pathLength = 0;
+  for (let i = end - n + 1; i <= end; i++) {
+    pathLength += Math.abs(closes[i] - closes[i - 1]);
+  }
+  return pathLength > 0 ? netMove / pathLength : 0;
+}
+
 // `st` = keluaran supertrend(bars) (sejajar dengan bar-bar terakhir).
 export function computeMetrics(bars: VBar[], st: STPoint[], end = bars.length - 1): Metrics | null {
   const off = bars.length - st.length;
@@ -80,6 +93,17 @@ export function computeMetrics(bars: VBar[], st: STPoint[], end = bars.length - 
   let barsInTrend = 0;
   for (let j = k; j >= 0 && st[j].trend === p.trend; j--) barsInTrend++;
 
+  // Hitung frekuensi flip tren dalam 60 bar terakhir (deteksi kondisi choppy / sideways)
+  let flips60: number | null = null;
+  if (k >= 10) {
+    const startIdx = Math.max(1, k - 59);
+    let flips = 0;
+    for (let j = startIdx; j <= k; j++) {
+      if (st[j].trend !== st[j - 1].trend) flips++;
+    }
+    flips60 = flips;
+  }
+
   const w20 = bars.slice(Math.max(0, end - 19), end + 1);
   const high20 = Math.max(...w20.map((x) => x.high));
   const low20 = Math.min(...w20.map((x) => x.low));
@@ -91,6 +115,7 @@ export function computeMetrics(bars: VBar[], st: STPoint[], end = bars.length - 
 
   const closes = bars.map((x) => x.close);
   const ema50 = emaAt(closes, end, 50);
+  const er30 = efficiencyRatioAt(closes, end, 30);
 
   let higherLow: boolean | null = null;
   if (end >= 19) {
@@ -127,6 +152,8 @@ export function computeMetrics(bars: VBar[], st: STPoint[], end = bars.length - 
     patternAge: recent ? end - (base + recent.index) : null,
     stLine,
     slRiskPct,
+    flips60,
+    er30,
   };
 }
 
@@ -170,5 +197,7 @@ export function metricsFromDb(d: any): Metrics | null {
     patternAge: n(d.pattern_age),
     stLine,
     slRiskPct,
+    flips60: n(d.flips60),
+    er30: n(d.er30),
   };
 }

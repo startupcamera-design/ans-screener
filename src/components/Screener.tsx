@@ -6,7 +6,17 @@ import { fetchAll, supabaseBrowser } from "@/lib/supabase-browser";
 import { INDEX_TICKER, MIN_AVG_VALUE, ST_MULT, ST_PERIOD } from "@/lib/config";
 import { Metrics, metricsFromDb } from "@/lib/metrics";
 import { percentileMap, scoreMetrics } from "@/lib/scoring";
-import { floorToIdxTick } from "@/lib/portfolio-advisor";
+import {
+  buildMorningActionText,
+  computePositionSizing,
+  DEFAULT_TRADING_PREFS,
+  floorToIdxTick,
+  loadTradingPrefs,
+  saveTradingPrefs,
+  type MorningBuyCandidate,
+  type PositionRow,
+  type TradingPrefs,
+} from "@/lib/portfolio-advisor";
 import MarketBanner from "./MarketBanner";
 import { scoreTone } from "./ScoreBreakdown";
 
@@ -30,6 +40,11 @@ type Row = {
   barsInTrend: number | null;
   avgValue: number | null;
   hasMetrics: boolean;
+};
+
+type HeldInfo = {
+  lots: number;
+  isZeroRisk: boolean; // SL terpasang atau garis ST sudah di atas harga beli
 };
 
 type SortKey = "ticker" | "score" | "close" | "change_pct" | "avgValue" | "trend" | "distAtr" | "slRiskPct" | "days_since_flip";
@@ -118,9 +133,21 @@ export default function Screener() {
   const router = useRouter();
   const listTop = useRef<HTMLDivElement>(null);
   const [rows, setRows] = useState<Row[]>([]);
-  const [heldLots, setHeldLots] = useState<Record<string, number>>({});
+  const [openPositions, setOpenPositions] = useState<PositionRow[]>([]);
+  const [ihsgBullish, setIhsgBullish] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Pengaturan Modal, Risiko/Trade, & Maks Slot Portofolio
+  const [prefs, setPrefs] = useState<TradingPrefs>(DEFAULT_TRADING_PREFS);
+  const [showSizingBar, setShowSizingBar] = useState(false);
+  const [capInput, setCapInput] = useState(String(DEFAULT_TRADING_PREFS.capitalRp));
+  const [riskInput, setRiskInput] = useState(String(DEFAULT_TRADING_PREFS.riskPerTradePct));
+  const [slotInput, setSlotInput] = useState(String(DEFAULT_TRADING_PREFS.maxPositions));
+
+  // Modal Morning Action Sheet
+  const [showActionSheet, setShowActionSheet] = useState(false);
+  const [copiedSheet, setCopiedSheet] = useState(false);
 
   const [f, setFState] = useState<Filters>(DEFAULTS);
   const [q, setQ] = useState("");
@@ -130,7 +157,7 @@ export default function Screener() {
   const [hydrated, setHydrated] = useState(false);
   const setF = (patch: Partial<Filters>) => setFState((s) => ({ ...s, ...patch }));
 
-  /* ---- simpan / pulihkan pilihan filter di browser ---- */
+  /* ---- simpan / pulihkan pilihan filter & preferensi modal di browser ---- */
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORE_KEY);
@@ -141,6 +168,11 @@ export default function Screener() {
           if (p.sort && SORT_KEYS.includes(p.sort.key) && (p.sort.dir === 1 || p.sort.dir === -1)) setSort(p.sort);
         }
       }
+      const loadedPrefs = loadTradingPrefs();
+      setPrefs(loadedPrefs);
+      setCapInput(String(loadedPrefs.capitalRp));
+      setRiskInput(String(loadedPrefs.riskPerTradePct));
+      setSlotInput(String(loadedPrefs.maxPositions));
     } catch {
       /* storage tidak tersedia: abaikan */
     }
@@ -155,6 +187,21 @@ export default function Screener() {
       /* abaikan */
     }
   }, [f, sort, hydrated]);
+
+  function handleSavePrefs(e: React.FormEvent) {
+    e.preventDefault();
+    const cap = parseNum(capInput);
+    const risk = parseNum(riskInput);
+    const slots = parseInt(slotInput, 10);
+    const updated: TradingPrefs = {
+      capitalRp: cap && cap > 0 ? Math.round(cap) : DEFAULT_TRADING_PREFS.capitalRp,
+      riskPerTradePct: risk && risk > 0 && risk <= 10 ? risk : DEFAULT_TRADING_PREFS.riskPerTradePct,
+      maxPositions: Number.isInteger(slots) && slots >= 1 && slots <= 20 ? slots : DEFAULT_TRADING_PREFS.maxPositions,
+    };
+    setPrefs(updated);
+    saveTradingPrefs(updated);
+    setShowSizingBar(false);
+  }
 
   /* ---- kunci scroll saat panel filter (mobile) terbuka ---- */
   useEffect(() => {
@@ -176,17 +223,26 @@ export default function Screener() {
         const db = supabaseBrowser();
         const [rawScreener, openPosRes] = await Promise.all([
           fetchAll<any>((from, to) => db.from("screener_latest").select("*").range(from, to)),
-          db.from("portfolio_positions").select("ticker,lots").eq("status", "OPEN"),
+          db.from("portfolio_positions").select("*").eq("status", "OPEN"),
         ]);
 
-        // Map posisi aktif di portofolio (akumulasi lot jika ada beberapa entry)
-        const held: Record<string, number> = {};
         if (!openPosRes.error && openPosRes.data) {
-          for (const p of openPosRes.data) {
-            held[p.ticker] = (held[p.ticker] ?? 0) + Number(p.lots);
-          }
+          setOpenPositions(
+            openPosRes.data.map((d: any) => ({
+              id: d.id,
+              ticker: d.ticker,
+              buy_date: d.buy_date,
+              buy_price: Number(d.buy_price),
+              lots: Number(d.lots),
+              sl_installed: d.sl_installed === null ? null : Number(d.sl_installed),
+              notes: d.notes ?? null,
+              status: d.status,
+              sell_date: d.sell_date ?? null,
+              sell_price: d.sell_price === null ? null : Number(d.sell_price),
+              exit_reason: d.exit_reason ?? null,
+            }))
+          );
         }
-        setHeldLots(held);
 
         const data = rawScreener.filter((d) => d.ticker !== INDEX_TICKER);
         const latest = data.reduce((mx, d) => (d.date > mx ? d.date : mx), "");
@@ -242,8 +298,38 @@ export default function Screener() {
     })();
   }, []);
 
+  const rowByTicker = useMemo(() => {
+    const m = new Map<string, Row>();
+    for (const r of rows) m.set(r.ticker, r);
+    return m;
+  }, [rows]);
+
+  // Peta saham yang sedang dipegang beserta status Zero Risk (untuk badge SUDAH DIPEGANG vs SIAP ADD-ON)
+  const heldMap = useMemo(() => {
+    const map: Record<string, HeldInfo> = {};
+    for (const p of openPositions) {
+      const r = rowByTicker.get(p.ticker);
+      const slActive = p.sl_installed ?? r?.slTickPrice ?? null;
+      const isZeroRisk =
+        slActive !== null &&
+        slActive >= p.buy_price &&
+        r !== undefined &&
+        r.trend === 1 &&
+        (r.distAtr === null || (r.distAtr >= 0.5 && r.distAtr <= 2.2));
+
+      if (!map[p.ticker]) {
+        map[p.ticker] = { lots: p.lots, isZeroRisk };
+      } else {
+        map[p.ticker].lots += p.lots;
+        map[p.ticker].isZeroRisk = map[p.ticker].isZeroRisk && isZeroRisk;
+      }
+    }
+    return map;
+  }, [openPositions, rowByTicker]);
+
   const latestDate = useMemo(() => rows.reduce((mx, r) => (r.date > mx ? r.date : mx), ""), [rows]);
-  const heldCount = useMemo(() => Object.keys(heldLots).length, [heldLots]);
+  const heldTickerCount = useMemo(() => Object.keys(heldMap).length, [heldMap]);
+  const freeSlots = Math.max(0, prefs.maxPositions - heldTickerCount);
 
   const summary = useMemo(() => {
     const live = rows.filter((r) => !r.stale);
@@ -301,6 +387,101 @@ export default function Screener() {
     });
   }, [base, f.preset, sort]);
 
+  // Kandidat antrean beli untuk Morning Action Sheet (Top Pick >= 86, SL <= 8%, belum dipegang)
+  const morningBuyCandidates: MorningBuyCandidate[] = useMemo(() => {
+    return rows
+      .filter(
+        (r) =>
+          !r.stale &&
+          r.volume > 0 &&
+          (r.avgValue === null || r.avgValue >= MIN_AVG_VALUE) &&
+          r.trend === 1 &&
+          (r.score ?? 0) >= 86 &&
+          r.slTickPrice !== null &&
+          (r.slRiskPct === null || r.slRiskPct >= -8) &&
+          !heldMap[r.ticker]
+      )
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+      .map((r) => {
+        const sizing = computePositionSizing({
+          entryPrice: r.close,
+          stopLossPrice: r.slTickPrice!,
+          prefs,
+          ihsgBullish,
+        });
+        return {
+          ticker: r.ticker,
+          score: r.score!,
+          close: r.close,
+          maxBuyLimit: r.maxBuyPrice,
+          orderSl: r.slTickPrice!,
+          lots: sizing.lots,
+          estimatedCostRp: sizing.estimatedCostRp,
+        };
+      })
+      .filter((c) => c.lots > 0);
+  }, [rows, heldMap, prefs, ihsgBullish]);
+
+  // Teks Morning Action Sheet dari Screener
+  const actionSheetText = useMemo(() => {
+    const pseudoAdvices = openPositions.map((pos) => {
+      const r = rowByTicker.get(pos.ticker);
+      if (!r) return { pos, advice: null };
+      const isBearish = r.trend !== 1;
+      const closeBreachedSl = pos.sl_installed !== null && r.close <= pos.sl_installed;
+      const needsSl =
+        !isBearish &&
+        r.slTickPrice !== null &&
+        (pos.sl_installed === null || r.slTickPrice > pos.sl_installed);
+
+return {
+        pos,
+        advice: {
+          code: isBearish || closeBreachedSl ? ("EXIT_STOP" as const) : needsSl ? ("RAISE_SL" as const) : ("HOLD" as const),
+          badge: isBearish || closeBreachedSl ? "JUAL BESOK · Sinyal Keluar" : needsSl ? "NAIKKAN TRAILING SL" : "HOLD",
+          badgeCls: "",
+          borderCls: "",
+          cardTintCls: "",
+          healthScore: isBearish || closeBreachedSl ? 8 : 75,
+          healthLabel: "",
+          healthColorCls: "",
+          healthReasons: [],
+          headline: "",
+          detail: "",
+          suggestedSl: r.slTickPrice,
+          holdingBars: 1,
+          currentPrice: r.close,
+          stLine: r.stLine ?? r.close,
+          pnlRp: (r.close - pos.buy_price) * pos.lots * 100,
+          pnlPct: ((r.close - pos.buy_price) / pos.buy_price) * 100,
+          marketValue: r.close * pos.lots * 100,
+          slRiskFromCurrentPct: r.slRiskPct ?? 0,
+          isBreakevenOrBetter: (r.slTickPrice ?? 0) >= pos.buy_price,
+          addOnReady: false,
+          addOnSuggestedLots: 0,
+        },
+      };
+    });
+
+    return buildMorningActionText({
+      dateLabel: latestDate ? fmtDate(latestDate) : undefined,
+      ihsgBullish,
+      openAdvices: pseudoAdvices,
+      buyCandidates: morningBuyCandidates,
+      maxPositions: prefs.maxPositions,
+    });
+  }, [openPositions, rowByTicker, latestDate, ihsgBullish, morningBuyCandidates, prefs.maxPositions]);
+
+  async function copyActionSheet() {
+    try {
+      await navigator.clipboard.writeText(actionSheetText);
+      setCopiedSheet(true);
+      setTimeout(() => setCopiedSheet(false), 2500);
+    } catch {
+      /* abaikan */
+    }
+  }
+
   useEffect(() => setPage(0), [q, f, sort]);
 
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
@@ -328,7 +509,7 @@ export default function Screener() {
   if (error) {
     return (
       <div className="space-y-4">
-        <MarketBanner bull={0} total={0} />
+        <MarketBanner bull={0} total={0} onRegimeChange={setIhsgBullish} />
         <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
           <div className="font-semibold">Gagal memuat data</div>
           <div className="mt-1">{error}</div>
@@ -352,30 +533,142 @@ export default function Screener() {
 
   return (
     <div className="space-y-5">
-      <MarketBanner bull={summary.bull} total={summary.bull + summary.bear} />
+      <MarketBanner bull={summary.bull} total={summary.bull + summary.bear} onRegimeChange={setIhsgBullish} />
 
-      <div className="flex flex-wrap items-end justify-between gap-2">
+      <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold tracking-tight md:text-2xl">Screener saham</h1>
           <p className="text-xs text-slate-500 md:text-sm">
             Data per {fmtDate(latestDate)} · Supertrend ATR {ST_PERIOD}, multiplier {ST_MULT.toFixed(1)} · {summary.live} emiten aktif
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-3 text-xs text-slate-600">
-          <span><b className="text-emerald-600">{summary.buy}</b> BUY baru</span>
-          <span><b className="text-rose-600">{summary.sell}</b> SELL baru</span>
-          <a
-            href="/portfolio"
-            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-semibold text-slate-800 hover:bg-slate-50"
+
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="hidden text-slate-600 sm:inline">
+            <b className="text-emerald-600">{summary.buy}</b> BUY · <b className="text-rose-600">{summary.sell}</b> SELL
+          </span>
+
+          <button
+            onClick={() => setShowSizingBar((v) => !v)}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-semibold text-slate-700 hover:bg-slate-50"
+            title="Atur modal, batas risiko per trade, dan batas jumlah posisi portofolio"
           >
-            <span>Portofolio Saya</span>
-            {heldCount > 0 && (
-              <span className="rounded-full bg-emerald-600 px-1.5 py-0.5 text-[10px] font-bold text-white">
-                {heldCount}
+            <span>Modal: Rp {idCompact.format(prefs.capitalRp)}</span>
+            <span className="text-slate-400">·</span>
+            <span>Risk {prefs.riskPerTradePct}%</span>
+            {ihsgBullish === false && (
+              <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-bold text-rose-700">
+                Porsi 50%
               </span>
             )}
+          </button>
+
+          <button
+            onClick={() => setShowActionSheet(true)}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-3 py-1.5 font-semibold text-white hover:bg-slate-800"
+          >
+            Morning Action Sheet
+          </button>
+
+          <a
+            href="/portfolio"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-300 bg-emerald-50/70 px-3 py-1.5 font-semibold text-emerald-900 hover:bg-emerald-100/70"
+          >
+            <span>Portofolio</span>
+            <span className="rounded-full bg-emerald-600 px-1.5 py-0.5 text-[10px] font-bold text-white">
+              {heldTickerCount}/{prefs.maxPositions}
+            </span>
             <span>→</span>
           </a>
+        </div>
+      </div>
+
+      {/* Bar Pengaturan Modal & Risk Sizing */}
+      {showSizingBar && (
+        <form
+          onSubmit={handleSavePrefs}
+          className="rounded-2xl border border-emerald-200 bg-white p-4 shadow-sm"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-bold text-slate-900">Pengaturan Position Sizing & Slot Portofolio</h2>
+              <p className="text-xs text-slate-500">
+                Digunakan untuk menghitung Lot Ideal otomatis di Screener, Detail Saham, dan Morning Action Sheet.
+              </p>
+            </div>
+            {ihsgBullish === false && (
+              <span className="rounded-full bg-rose-100 px-3 py-1 text-xs font-bold text-rose-800">
+                IHSG Bearish Aktif: Lot otomatis dikali 50%
+              </span>
+            )}
+          </div>
+
+          <div className="mt-3 grid gap-3 sm:grid-cols-4">
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">Total Modal (Rp)</span>
+              <input
+                required
+                inputMode="numeric"
+                value={capInput}
+                onChange={(e) => setCapInput(e.target.value)}
+                placeholder="100000000"
+                className={inputCls}
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">Maks Risiko / Trade (%)</span>
+              <input
+                required
+                inputMode="decimal"
+                value={riskInput}
+                onChange={(e) => setRiskInput(e.target.value)}
+                placeholder="1.0"
+                className={inputCls}
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">Maks Slot Saham Aktif</span>
+              <input
+                required
+                inputMode="numeric"
+                value={slotInput}
+                onChange={(e) => setSlotInput(e.target.value)}
+                placeholder="5"
+                className={inputCls}
+              />
+            </label>
+            <div className="flex items-end gap-2">
+              <button
+                type="submit"
+                className="w-full rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700"
+              >
+                Simpan Pengaturan
+              </button>
+            </div>
+          </div>
+        </form>
+      )}
+
+      {/* Indikator Slot Portofolio */}
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs">
+        <div className="flex flex-wrap items-center gap-2 text-slate-700">
+          <span className="font-semibold text-slate-900">
+            Slot Portofolio Terisi: {heldTickerCount} / {prefs.maxPositions} posisi
+          </span>
+          <span
+            className={`rounded-full px-2.5 py-0.5 font-bold ${
+              freeSlots > 0 ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"
+            }`}
+          >
+            {freeSlots > 0 ? `Sisa ${freeSlots} slot belanja besok` : "Slot penuh · Tunggu exit dulu"}
+          </span>
+        </div>
+        <div className="text-slate-500">
+          Batas rugi per posisi:{" "}
+          <b className="tabular-nums text-slate-800">
+            Rp {idPrice.format(prefs.capitalRp * (prefs.riskPerTradePct / 100) * (ihsgBullish === false ? 0.5 : 1))}
+          </b>{" "}
+          ({ihsgBullish === false ? `${prefs.riskPerTradePct * 0.5}% defensif` : `${prefs.riskPerTradePct}% standar`})
         </div>
       </div>
 
@@ -490,10 +783,10 @@ export default function Screener() {
         <dl className="mt-3 grid gap-x-8 gap-y-2.5 text-slate-600 md:grid-cols-2">
           <Def t="Skor (0–100)">Teruji backtest untuk swing 10–20 hari bursa. Fokus utama pada kuintil teratas (Skor ≥ 86) dan urutkan dari skor tertinggi.</Def>
           <Def t="Order SL (Fraksi BEI)">Otomatis dibulatkan 1 tick BEI di bawah garis Supertrend ATR {ST_PERIOD} (mult {ST_MULT}) agar siap langsung dipasang di sekuritas. Hindari masuk jika risiko SL lebih dalam dari -8%.</Def>
+          <Def t="Lot Ideal (Position Sizing)">Dihitung otomatis dari batas risiko modal Anda per trade dan jarak ke Order SL (otomatis dipotong 50% jika IHSG Bearish).</Def>
           <Def t="Batas Beli (+1,5%)">Harga limit order beli maksimal (sudah sesuai fraksi BEI). Jika harga pembukaan gap up di atas batas ini, lewati kandidat tersebut.</Def>
           <Def t="Usia Tren (Bar)">Tren paling optimal di rentang 5–40 bar sejak sinyal BUY. Sinyal 1–4 bar masih rawan false breakout, sedangkan di atas 40 bar sudah matang.</Def>
-          <Def t="RS % (Kekuatan Relatif)">Peringkat performa 3 bulan terakhir dibanding seluruh saham bursa (0–100%). Makin tinggi berarti pemimpin pasar.</Def>
-          <Def t="Nilai/hari">Rata-rata nilai transaksi 20 hari (minimal Rp {idNum.format(MIN_AVG_VALUE)}/hari) agar likuid dan mudah dieksekusi.</Def>
+          <Def t="RS % & Nilai/hari">Peringkat kekuatan relatif 3 bulan (0–100%) dan rata-rata likuiditas 20 hari (minimal Rp {idNum.format(MIN_AVG_VALUE)}/hari).</Def>
         </dl>
         <p className="mt-3 text-xs text-slate-500">Alat bantu analisis teknikal, bukan rekomendasi investasi.</p>
       </details>
@@ -510,6 +803,7 @@ export default function Screener() {
               <th className="px-3 py-2.5 text-right font-medium" title="Batas maksimal limit order beli (+1,5% dibulatkan ke fraksi BEI)">Beli Maks</th>
               <th className="px-3 py-2.5 text-right font-medium" title="Harga auto-SL (1 tick BEI di bawah garis Supertrend)">Order SL</th>
               <Th k="slRiskPct" label="Risiko SL" right sort={sort} onSort={toggleSort} tip="Persentase rugi dari close jika kena Order SL (maksimal ideal -8%)" />
+              <th className="px-3 py-2.5 text-right font-medium" title="Ukuran lot ideal sesuai batas risiko modal & rezim IHSG">Lot Ideal</th>
               <Th k="days_since_flip" label="Usia tren" sort={sort} onSort={toggleSort} tip="Ideal pada 5–40 bar sejak sinyal BUY" />
               <th className="px-3 py-2.5 text-right font-medium" title="Peringkat kekuatan relatif 60 bar (0–100)">RS</th>
               <Th k="avgValue" label="Nilai/hari" right sort={sort} onSort={toggleSort} tip="Rata-rata nilai transaksi 20 hari" />
@@ -517,29 +811,47 @@ export default function Screener() {
           </thead>
           <tbody className="divide-y divide-slate-100">
             {view.map((r) => {
-              const lots = heldLots[r.ticker];
+              const held = heldMap[r.ticker];
+              const sizing =
+                r.trend === 1 && r.slTickPrice !== null
+                  ? computePositionSizing({
+                      entryPrice: r.close,
+                      stopLossPrice: r.slTickPrice,
+                      prefs,
+                      ihsgBullish,
+                    })
+                  : null;
+
               return (
                 <tr
                   key={r.ticker}
                   onClick={() => open(r.ticker)}
                   className={`cursor-pointer hover:bg-emerald-50/50 ${r.stale ? "text-slate-400" : ""} ${
-                    lots ? "bg-sky-50/35" : ""
+                    held ? (held.isZeroRisk ? "bg-emerald-50/35" : "bg-sky-50/35") : ""
                   }`}
                 >
                   <td className="px-3 py-2.5 font-semibold">
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       <span>
                         {r.ticker.replace(/\.JK$/, "")}
                         <span className="text-xs font-normal text-slate-400">.JK</span>
                       </span>
-                      {lots && (
-                        <span
-                          title={`Saham ini sudah ada di Portofolio Saya (${lots} Lot)`}
-                          className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-bold text-sky-800"
-                        >
-                          Pegang {lots} Lot
-                        </span>
-                      )}
+                      {held &&
+                        (held.isZeroRisk ? (
+                          <span
+                            title={`Posisi ${held.lots} Lot sudah Zero Risk (SL >= harga beli), memenuhi syarat add-on`}
+                            className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-bold text-emerald-800"
+                          >
+                            SIAP ADD-ON ({held.lots}L)
+                          </span>
+                        ) : (
+                          <span
+                            title={`Saham ini sudah ada di Portofolio Saya (${held.lots} Lot)`}
+                            className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-bold text-sky-800"
+                          >
+                            SUDAH DIPEGANG ({held.lots}L)
+                          </span>
+                        ))}
                       {r.stale && <span className="text-[10px] font-normal">({fmtDate(r.date)})</span>}
                     </div>
                   </td>
@@ -563,6 +875,18 @@ export default function Screener() {
                   >
                     {r.slRiskPct === null ? "–" : `${r.slRiskPct.toFixed(1)}%`}
                   </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums">
+                    {sizing && sizing.lots > 0 ? (
+                      <div className="leading-tight">
+                        <span className="font-bold text-slate-900">{sizing.lots} L</span>
+                        <span className="block text-[10px] text-slate-400">
+                          {idCompact.format(sizing.estimatedCostRp)}
+                        </span>
+                      </div>
+                    ) : (
+                      <span className="text-slate-300">–</span>
+                    )}
+                  </td>
                   <td className="px-3 py-2.5"><SignalCell r={r} /></td>
                   <td className="px-3 py-2.5 text-right text-xs tabular-nums text-slate-600">
                     {r.rsPct === null ? "–" : `${r.rsPct}%`}
@@ -578,24 +902,43 @@ export default function Screener() {
       {/* ---- Kartu (mobile dan tablet) ---- */}
       <div className="grid gap-2.5 sm:grid-cols-2 lg:hidden">
         {view.map((r) => {
-          const lots = heldLots[r.ticker];
+          const held = heldMap[r.ticker];
+          const sizing =
+            r.trend === 1 && r.slTickPrice !== null
+              ? computePositionSizing({
+                  entryPrice: r.close,
+                  stopLossPrice: r.slTickPrice,
+                  prefs,
+                  ihsgBullish,
+                })
+              : null;
+
           return (
             <button
               key={r.ticker}
               onClick={() => open(r.ticker)}
               className={`flex w-full items-stretch gap-3 rounded-2xl border p-3.5 text-left active:bg-slate-50 ${
-                lots ? "border-sky-200 bg-sky-50/30" : "border-slate-200 bg-white"
+                held
+                  ? held.isZeroRisk
+                    ? "border-emerald-300 bg-emerald-50/30"
+                    : "border-sky-200 bg-sky-50/30"
+                  : "border-slate-200 bg-white"
               } ${r.stale ? "opacity-60" : ""}`}
             >
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-base font-bold">{r.ticker.replace(/\.JK$/, "")}</span>
                   <TrendBadge trend={r.trend} />
-                  {lots && (
-                    <span className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-bold text-sky-800">
-                      Pegang {lots}L
-                    </span>
-                  )}
+                  {held &&
+                    (held.isZeroRisk ? (
+                      <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-bold text-emerald-800">
+                        SIAP ADD-ON ({held.lots}L)
+                      </span>
+                    ) : (
+                      <span className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-bold text-sky-800">
+                        DIPEGANG ({held.lots}L)
+                      </span>
+                    ))}
                   {r.rsPct !== null && (
                     <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">
                       RS {r.rsPct}%
@@ -624,6 +967,11 @@ export default function Screener() {
                       Beli ≤ <b className="tabular-nums text-emerald-700">{idPrice.format(r.maxBuyPrice)}</b>
                     </span>
                   )}
+                  {sizing && sizing.lots > 0 && (
+                    <span>
+                      Ideal <b className="tabular-nums text-slate-800">{sizing.lots} Lot</b> ({idCompact.format(sizing.estimatedCostRp)})
+                    </span>
+                  )}
                 </div>
               </div>
               <ScoreCircle score={r.score} />
@@ -646,6 +994,61 @@ export default function Screener() {
           <span className="text-slate-600">Halaman {page + 1} / {pages}</span>
           <button disabled={page >= pages - 1} onClick={() => goPage(page + 1)} className={pageBtn}>Berikutnya →</button>
         </nav>
+      )}
+
+      {/* Modal Morning Action Sheet */}
+      {showActionSheet && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+          onClick={() => setShowActionSheet(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-2xl space-y-4 rounded-2xl bg-white p-5 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Morning Action Sheet · Rencana Besok Pagi</h3>
+                <p className="text-xs text-slate-500">
+                  Gabungan prioritas Jual/Exit, Update Auto-SL, dan Antrean Beli Top Pick sesuai sisa slot ({freeSlots}/{prefs.maxPositions}).
+                </p>
+              </div>
+              <button
+                onClick={() => setShowActionSheet(false)}
+                className="rounded-lg px-2 py-1 text-sm text-slate-400 hover:text-slate-700"
+              >
+                ✕
+              </button>
+            </div>
+
+            <pre className="max-h-96 overflow-y-auto whitespace-pre-wrap rounded-xl bg-slate-900 p-4 font-mono text-xs leading-relaxed text-slate-100">
+              {actionSheetText}
+            </pre>
+
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <a
+                href="/portfolio"
+                className="text-xs font-semibold text-emerald-700 hover:underline"
+              >
+                Buka detail evaluasi di Portofolio →
+              </a>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowActionSheet(false)}
+                  className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-semibold text-slate-600"
+                >
+                  Tutup
+                </button>
+                <button
+                  onClick={copyActionSheet}
+                  className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
+                >
+                  {copiedSheet ? "✓ Tersalin ke Clipboard!" : "Salin Semua Order Besok"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

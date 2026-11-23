@@ -1,4 +1,4 @@
-// Backtest skor saham ANS Screener.
+// Backtest skor saham ANS Screener (dengan evaluasi filter anti-sideways & penalti struktural).
 //
 // Pakai:  npm run backtest -- ./data-csv [--cost 0.004] [--split 0.7] [--step 1]
 // Input : folder (atau file) CSV berformat sama dengan yang diunggah ke aplikasi.
@@ -61,7 +61,7 @@ if (files.length === 0) {
 const all: PriceRow[] = [];
 let rowsTotal = 0, rowsSkipped = 0, rowsError = 0;
 for (const f of files) {
-  const lines = readFileSync(f, "utf8").replace(/^﻿/, "").split(/\r?\n/);
+  const lines = readFileSync(f, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/);
   const head = (lines[0] ?? "").split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
   const bad = checkHeaders(head);
   if (bad) {
@@ -106,10 +106,22 @@ const quant = (sorted: number[], q: number) => sorted[Math.min(sorted.length - 1
 /* ---------------- hasil per sinyal ---------------- */
 type Out = { ret: number; retStop: number; stop: boolean; mae: number; target: boolean };
 type Sig = {
-  ticker: string; date: string; score: number; fr: number[]; distAtr: number | null; rr: number | null;
-  regime: 1 | -1 | null; out: (Out | null)[];
+  ticker: string;
+  date: string;
+  score: number;
+  rawScore: number;
+  penalized: boolean;
+  fr: number[];
+  distAtr: number | null;
+  slRiskPct: number | null;
+  rr: number | null;
+  flips60: number | null;
+  er30: number | null;
+  aboveEma50: boolean | null;
+  regime: 1 | -1 | null;
+  out: (Out | null)[];
 };
-type Cand = Omit<Sig, "score" | "fr"> & { m: NonNullable<ReturnType<typeof computeMetrics>> };
+type Cand = Omit<Sig, "score" | "rawScore" | "penalized" | "fr"> & { m: NonNullable<ReturnType<typeof computeMetrics>> };
 
 function outcome(bars: VBar[], st: ReturnType<typeof supertrend>, off: number, e: number, h: number, target: number): Out | null {
   const x = e + h;
@@ -171,7 +183,15 @@ for (const [ticker, bars] of series) {
     if (!m || m.trend !== 1 || m.avgValue20 < MIN_VALUE) continue;
     const high20 = Math.max(...bars.slice(Math.max(0, e - 19), e + 1).map((b) => b.high));
     cands.push({
-      ticker, date: bars[e].date, distAtr: m.distAtr, rr: m.rr, m,
+      ticker,
+      date: bars[e].date,
+      distAtr: m.distAtr,
+      slRiskPct: m.slRiskPct,
+      rr: m.rr,
+      flips60: m.flips60 ?? null,
+      er30: m.er30 ?? null,
+      aboveEma50: m.aboveEma50,
+      m,
       regime: regimeByDate.get(bars[e].date) ?? null,
       out: HORIZONS.map((h) => outcome(bars, st, off, e, h, high20)),
     });
@@ -183,10 +203,32 @@ const rsByDate = new Map<string, Map<string, number>>();
 for (const [d, arr] of ret60ByDate) rsByDate.set(d, percentileMap(arr.map((x) => ({ key: x.ticker, value: x.value }))));
 
 const sigs: Sig[] = [];
+let partMeta: { key: keyof typeof WEIGHTS; label: string; weight: number }[] = [];
+
 for (const c of cands) {
   const res = scoreMetrics(c.m, rsByDate.get(c.date)?.get(c.ticker) ?? null, MIN_VALUE);
   if (!res.eligible) continue;
-  sigs.push({ ticker: c.ticker, date: c.date, score: res.total, fr: res.parts.map((p) => p.fraction), distAtr: c.distAtr, rr: c.rr, regime: c.regime, out: c.out });
+  if (partMeta.length === 0) {
+    partMeta = res.parts.map((p) => ({ key: p.key, label: p.label, weight: p.weight }));
+  }
+  const tw = res.parts.reduce((s, p) => s + p.weight, 0);
+  const rawScore = tw > 0 ? Math.round((res.parts.reduce((s, p) => s + p.weight * p.fraction, 0) / tw) * 100) : res.total;
+  sigs.push({
+    ticker: c.ticker,
+    date: c.date,
+    score: res.total,
+    rawScore,
+    penalized: res.total < rawScore,
+    fr: res.parts.map((p) => p.fraction),
+    distAtr: c.distAtr,
+    slRiskPct: c.slRiskPct,
+    rr: c.rr,
+    flips60: c.flips60,
+    er30: c.er30,
+    aboveEma50: c.aboveEma50,
+    regime: c.regime,
+    out: c.out,
+  });
 }
 if (sigs.length < 200) {
   console.error(`Hanya ${sigs.length} sinyal yang memenuhi syarat. Data terlalu pendek untuk backtest yang bermakna (butuh riwayat beberapa ratus hari).`);
@@ -256,13 +298,17 @@ function spearman(x: number[], y: number[]): number | null {
   }
   return sxx === 0 || syy === 0 ? null : sxy / Math.sqrt(sxx * syy);
 }
-function icOf(rows: Sig[], get: (s: Sig) => number) {
+function icOf(rows: Sig[], get: (s: Sig) => number | null) {
   const byDate = new Map<string, Sig[]>();
-  for (const r of rows) if (r.out[PRIMARY]) (byDate.get(r.date) ?? byDate.set(r.date, []).get(r.date)!).push(r);
+  for (const r of rows) {
+    if (r.out[PRIMARY] && get(r) !== null) {
+      (byDate.get(r.date) ?? byDate.set(r.date, []).get(r.date)!).push(r);
+    }
+  }
   const ics: number[] = [];
   for (const g of byDate.values()) {
     if (g.length < 20) continue;
-    const v = spearman(g.map(get), g.map((r) => r.out[PRIMARY]!.ret));
+    const v = spearman(g.map((x) => get(x) as number), g.map((r) => r.out[PRIMARY]!.ret));
     if (v !== null) ics.push(v);
   }
   if (ics.length < 10) return { ic: NaN, t: NaN, days: ics.length };
@@ -274,10 +320,8 @@ function icOf(rows: Sig[], get: (s: Sig) => number) {
 /* ---------------- laporan ---------------- */
 const L: string[] = [];
 const w = (s = "") => L.push(s);
-const names = ["Kedekatan ke garis", "Risk/reward", "Kualitas tren", "Umur tren", "Kedalaman koreksi", "Volume mengering", "Pola candle bullish", "Kekuatan relatif"];
-const keys = Object.keys(WEIGHTS);
 
-w("# Laporan backtest skor ANS Screener");
+w("# Laporan backtest skor ANS Screener (Scoring v2 · Anti-Sideways)");
 w();
 w(`- Data: ${files.length} file, ${series.size} ticker, ${dates[0]} s/d ${dates[dates.length - 1]}`);
 w(`- Sinyal diuji: ${sigs.length} (saham bullish, likuid ≥ Rp ${MIN_VALUE.toLocaleString("id-ID")}/hari), pengambilan sampel tiap ${STEP} bar`);
@@ -318,49 +362,70 @@ for (const [per, rows] of [["TRAIN", train], ["TEST", test]] as const) {
   }
 }
 
-// skor tertinggi secara mutlak (periode TEST), horizon utama
-w(`## 3. Skor tinggi saja (periode TEST, ${PH} hari)`);
+// Ambang tetap aplikasi (Top Pick >= 86 & SL <= 8%) di periode TEST
+w(`## 3. Ambang tetap aplikasi & Top Pick (periode TEST, ${PH} hari)`);
 w();
 w(HEAD);
-for (const th of [50, 60, 70, 80]) {
+for (const th of [60, 70, 78, 86]) {
   const sel = test.filter((s) => s.score >= th);
   const s = stats(sel, PRIMARY);
   w(row(`Skor ≥ ${th}`, s));
   addCsv("test", `Skor >= ${th}`, PH, s);
 }
+const topPickStrict = test.filter((s) => s.score >= 86 && (s.slRiskPct === null || s.slRiskPct >= -8));
+const sTopStrict = stats(topPickStrict, PRIMARY);
+w(row("**Top Pick Aplikasi (Skor ≥ 86 & SL ≤ 8%)**", sTopStrict));
+addCsv("test", "Top Pick Aplikasi (>=86 & SL<=8%)", PH, sTopStrict);
 w();
 
 w(`## 4. Daya prediksi tiap faktor (Spearman IC terhadap return ${PH} hari)`);
 w();
-w("IC = korelasi peringkat antar saham pada hari yang sama, dirata-ratakan lintas hari. **t\\*** = t dibagi akar(horizon) untuk mengoreksi return yang tumpang-tindih; pada data acak murni, t mentah pun bisa mencapai ±4. Faktor baru layak dipercaya bila tanda IC sama di TRAIN dan TEST, |IC| > 0,02, dan |t\\*| > 2 di keduanya.");
+w("IC = korelasi peringkat antar saham pada hari yang sama, dirata-ratakan lintas hari. **t\\*** = t dibagi akar(horizon) untuk mengoreksi return yang tumpang-tindih. Faktor layak dipercaya bila tanda IC sama di TRAIN dan TEST, |IC| > 0,02, dan |t\\*| > 2 di keduanya.");
 w();
 w("| Faktor | Bobot | IC train | t* | IC test | t* | Konsisten? |\n|---|---:|---:|---:|---:|---:|---|");
-const icRows: { name: string; icTrain: number; icTest: number }[] = [];
-for (let k = 0; k < keys.length; k++) {
+for (let k = 0; k < partMeta.length; k++) {
+  const pm = partMeta[k];
   const a = icOf(train, (s) => s.fr[k]);
   const b = icOf(test, (s) => s.fr[k]);
   const same =
     Number.isFinite(a.ic) && Number.isFinite(b.ic) && Math.sign(a.ic) === Math.sign(b.ic) &&
     Math.abs(a.ic) > 0.02 && Math.abs(b.ic) > 0.02 && Math.abs(a.t) / Math.sqrt(PH) > 2 && Math.abs(b.t) / Math.sqrt(PH) > 2;
-  icRows.push({ name: names[k], icTrain: a.ic, icTest: b.ic });
-  w(`| ${names[k]} | ${WEIGHTS[keys[k] as keyof typeof WEIGHTS]} | ${a.ic.toFixed(3)} | ${(a.t / Math.sqrt(PH)).toFixed(1)} | ${b.ic.toFixed(3)} | ${(b.t / Math.sqrt(PH)).toFixed(1)} | ${same ? (a.ic > 0 ? "ya, positif" : "ya, NEGATIF") : "tidak"} |`);
+  w(`| ${pm.label} | ${pm.weight} | ${a.ic.toFixed(3)} | ${(a.t / Math.sqrt(PH)).toFixed(1)} | ${b.ic.toFixed(3)} | ${(b.t / Math.sqrt(PH)).toFixed(1)} | ${same ? (a.ic > 0 ? "ya, positif" : "ya, NEGATIF") : "tidak"} |`);
 }
+// Tambahan IC khusus metrik anti-sideways baru (negatif pada flips60 berarti makin banyak flip makin buruk return-nya)
+const flipTr = icOf(train, (s) => s.flips60), flipTe = icOf(test, (s) => s.flips60);
+w(`| *Metrik baru: Frekuensi Flip 60h* | – | ${flipTr.ic.toFixed(3)} | ${(flipTr.t / Math.sqrt(PH)).toFixed(1)} | ${flipTe.ic.toFixed(3)} | ${(flipTe.t / Math.sqrt(PH)).toFixed(1)} | (negatif = whipsaw buruk) |`);
+const erTr = icOf(train, (s) => s.er30), erTe = icOf(test, (s) => s.er30);
+w(`| *Metrik baru: Efficiency Ratio 30h* | – | ${erTr.ic.toFixed(3)} | ${(erTr.t / Math.sqrt(PH)).toFixed(1)} | ${erTe.ic.toFixed(3)} | ${(erTe.t / Math.sqrt(PH)).toFixed(1)} | (positif = tren lurus unggul) |`);
 const sa = icOf(train, (s) => s.score), sb = icOf(test, (s) => s.score);
-w(`| **Skor total** | 100 | ${sa.ic.toFixed(3)} | ${(sa.t / Math.sqrt(PH)).toFixed(1)} | ${sb.ic.toFixed(3)} | ${(sb.t / Math.sqrt(PH)).toFixed(1)} | |`);
+w(`| **Skor total (setelah penalti)** | 100 | ${sa.ic.toFixed(3)} | ${(sa.t / Math.sqrt(PH)).toFixed(1)} | ${sb.ic.toFixed(3)} | ${(sb.t / Math.sqrt(PH)).toFixed(1)} | |`);
 w();
 
-w(`## 5. Faktor tinggi vs rendah (seluruh data, ${PH} hari)`);
+w(`## 5. Faktor tinggi vs rendah & Uji Filter Anti-Sideways (seluruh data, ${PH} hari)`);
 w();
 w("Tinggi = fraksi faktor ≥ 0,67 (untuk pola candle: ada pola). Rendah = ≤ 0,33 (pola candle: tidak ada).");
 w();
 w("| Faktor | n tinggi | Rata-rata tinggi | Stop tinggi | n rendah | Rata-rata rendah | Stop rendah | Selisih |\n|---|---:|---:|---:|---:|---:|---:|---:|");
-for (let k = 0; k < keys.length; k++) {
-  const isCandle = keys[k] === "candle";
+for (let k = 0; k < partMeta.length; k++) {
+  const pm = partMeta[k];
+  const isCandle = pm.key === "candle";
   const hi = sigs.filter((s) => (isCandle ? s.fr[k] > 0 : s.fr[k] >= 0.67));
   const lo = sigs.filter((s) => (isCandle ? s.fr[k] === 0 : s.fr[k] <= 0.33));
   const a = stats(hi, PRIMARY), b = stats(lo, PRIMARY);
-  w(`| ${names[k]} | ${a.n} | ${pct(a.avg)} | ${pct(a.stop, 0)} | ${b.n} | ${pct(b.avg)} | ${pct(b.stop, 0)} | ${pct(a.avg - b.avg)} |`);
+  w(`| ${pm.label} | ${a.n} | ${pct(a.avg)} | ${pct(a.stop, 0)} | ${b.n} | ${pct(b.avg)} | ${pct(b.stop, 0)} | ${pct(a.avg - b.avg)} |`);
 }
+w();
+
+// Uji langsung efektivitas penalti struktural & filter anti-sideways
+w(`### 5b. Dampak Filter Anti-Sideways (seluruh data, ${PH} hari)`);
+w();
+w(HEAD);
+w(row("Struktur tren bersih (tanpa penalti)", stats(sigs.filter((s) => !s.penalized), PRIMARY)));
+w(row("Terkena penalti (sideways / < EMA50 / ret60≤0)", stats(sigs.filter((s) => s.penalized), PRIMARY)));
+w(row("Tren mulus (flips60 ≤ 2)", stats(sigs.filter((s) => s.flips60 !== null && s.flips60 <= 2), PRIMARY)));
+w(row("Pasar choppy/whipsaw (flips60 ≥ 4)", stats(sigs.filter((s) => s.flips60 !== null && s.flips60 >= 4), PRIMARY)));
+w(row("Efficiency Ratio tinggi (er30 ≥ 0.35)", stats(sigs.filter((s) => s.er30 !== null && s.er30 >= 0.35), PRIMARY)));
+w(row("Efficiency Ratio rendah / sideways (er30 < 0.18)", stats(sigs.filter((s) => s.er30 !== null && s.er30 < 0.18), PRIMARY)));
 w();
 
 const hasRegime = sigs.some((s) => s.regime !== null);
@@ -390,6 +455,7 @@ w("## Ringkasan");
 w();
 w(`- Selisih kuintil teratas − terendah (${PH} hari): train ${pct(spreadTrain)}, test ${pct(spreadTest)}.`);
 w(`- Kuintil teratas vs seluruh sinyal di periode test: ${pct(edgeTest)} (n=${teQ5.n}).`);
+w(`- Top Pick Aplikasi (Skor ≥ 86 & SL ≤ 8%) di periode test: rata-rata ${pct(sTopStrict.avg)}, kena stop ${pct(sTopStrict.stop, 0)} (n=${sTopStrict.n}).`);
 w(`- Kuintil teratas: kena stop ${pct(teQ5.stop, 0)} vs ${pct(teAll.stop, 0)} untuk seluruh sinyal (periode test).`);
 let verdict: string;
 if (teQ5.n < 300) verdict = "Sampel kuintil teratas di periode test masih kecil (n < 300); kesimpulan belum bisa dipercaya. Tambah riwayat data.";
@@ -405,9 +471,9 @@ mkdirSync(outDir, { recursive: true });
 writeFileSync(join(outDir, "backtest-report.md"), L.join("\n") + "\n");
 writeFileSync(join(outDir, "backtest-buckets.csv"), csv.join("\n") + "\n");
 if (opt.dump) {
-  const lines = ["ticker,date,score,regime," + HORIZONS.flatMap((h) => [`ret${h}`, `retstop${h}`, `stop${h}`, `mae${h}`]).join(",")];
+  const lines = ["ticker,date,score,raw_score,penalized,flips60,er30,regime," + HORIZONS.flatMap((h) => [`ret${h}`, `retstop${h}`, `stop${h}`, `mae${h}`]).join(",")];
   for (const s of sigs) {
-    lines.push([s.ticker, s.date, s.score, s.regime ?? "", ...s.out.flatMap((o) => (o ? [o.ret, o.retStop, o.stop ? 1 : 0, o.mae] : ["", "", "", ""]))].join(","));
+    lines.push([s.ticker, s.date, s.score, s.rawScore, s.penalized ? 1 : 0, s.flips60 ?? "", s.er30 ?? "", s.regime ?? "", ...s.out.flatMap((o) => (o ? [o.ret, o.retStop, o.stop ? 1 : 0, o.mae] : ["", "", "", ""]))].join(","));
   }
   writeFileSync(join(outDir, "backtest-signals.csv"), lines.join("\n") + "\n");
 }

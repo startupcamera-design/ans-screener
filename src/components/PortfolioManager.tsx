@@ -2,16 +2,26 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { supabaseBrowser } from "@/lib/supabase-browser";
-import { ST_MULT, ST_PERIOD } from "@/lib/config";
+import { fetchAll, supabaseBrowser } from "@/lib/supabase-browser";
+import { INDEX_TICKER, MIN_AVG_VALUE, ST_MULT, ST_PERIOD } from "@/lib/config";
 import { supertrend } from "@/lib/supertrend";
-import type { VBar } from "@/lib/metrics";
+import { metricsFromDb, type VBar } from "@/lib/metrics";
+import { percentileMap, scoreMetrics } from "@/lib/scoring";
 import {
+  buildMorningActionText,
   computePerformanceStats,
+  computePositionSizing,
+  DEFAULT_TRADING_PREFS,
   evaluatePosition,
+  EXIT_REASON_LABELS,
+  EXIT_REASON_OPTIONS,
   floorToIdxTick,
+  loadTradingPrefs,
+  type ExitReason,
+  type MorningBuyCandidate,
   type PositionAdvice,
   type PositionRow,
+  type TradingPrefs,
 } from "@/lib/portfolio-advisor";
 
 const fmtInt = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 0 });
@@ -26,8 +36,18 @@ type EnrichedPosition = {
 export default function PortfolioManager() {
   const [positions, setPositions] = useState<PositionRow[]>([]);
   const [barsMap, setBarsMap] = useState<Record<string, VBar[]>>({});
+  const [ihsgBullish, setIhsgBullish] = useState<boolean | null>(null);
+  const [prefs, setPrefs] = useState<TradingPrefs>(DEFAULT_TRADING_PREFS);
+  const [screenerTopPicks, setScreenerTopPicks] = useState<
+    { ticker: string; score: number; close: number; slTickPrice: number; maxBuyPrice: number }[]
+  >([]);
+  const [latestMarketDate, setLatestMarketDate] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+
+  // Modal Morning Action Sheet
+  const [showActionSheet, setShowActionSheet] = useState(false);
+  const [copiedSheet, setCopiedSheet] = useState(false);
 
   // Form tambah posisi
   const [showAdd, setShowAdd] = useState(false);
@@ -46,21 +66,29 @@ export default function PortfolioManager() {
   const [closingPos, setClosingPos] = useState<EnrichedPosition | null>(null);
   const [sellDate, setSellDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [sellPrice, setSellPrice] = useState("");
+  const [exitReason, setExitReason] = useState<ExitReason>("AUTO_SL");
+
+  useEffect(() => {
+    setPrefs(loadTradingPrefs());
+  }, []);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     setErr(null);
     try {
       const db = supabaseBrowser();
-      const { data: posData, error: posErr } = await db
-        .from("portfolio_positions")
-        .select("*")
-        .order("status", { ascending: false })
-        .order("buy_date", { ascending: false });
+      const [posRes, rawScreener] = await Promise.all([
+        db
+          .from("portfolio_positions")
+          .select("*")
+          .order("status", { ascending: false })
+          .order("buy_date", { ascending: false }),
+        fetchAll<any>((from, to) => db.from("screener_latest").select("*").range(from, to)),
+      ]);
 
-      if (posErr) throw new Error(posErr.message);
+      if (posRes.error) throw new Error(posRes.error.message);
 
-      const list: PositionRow[] = (posData ?? []).map((d: any) => ({
+      const list: PositionRow[] = (posRes.data ?? []).map((d: any) => ({
         id: d.id,
         ticker: d.ticker,
         buy_date: d.buy_date,
@@ -71,9 +99,64 @@ export default function PortfolioManager() {
         status: d.status,
         sell_date: d.sell_date ?? null,
         sell_price: d.sell_price === null ? null : Number(d.sell_price),
+        exit_reason: (d.exit_reason as ExitReason | null) ?? null,
       }));
       setPositions(list);
 
+      // Rezim IHSG & kandidat Top Pick dari screener_latest untuk Morning Action Sheet
+      const idxRow = rawScreener.find((d) => d.ticker === INDEX_TICKER);
+      if (idxRow && idxRow.trend !== null && idxRow.trend !== undefined) {
+        setIhsgBullish(Number(idxRow.trend) === 1);
+      }
+
+      const stocksOnly = rawScreener.filter((d) => d.ticker !== INDEX_TICKER);
+      const latest = stocksOnly.reduce((mx, d) => (d.date > mx ? d.date : mx), "");
+      setLatestMarketDate(latest);
+
+      const metrics = stocksOnly.map((d) => metricsFromDb(d));
+      const pm = percentileMap(
+        stocksOnly.map((d, i) => ({
+          key: d.ticker,
+          value: d.date === latest ? metrics[i]?.ret60 ?? null : null,
+        }))
+      );
+
+      const picks: {
+        ticker: string;
+        score: number;
+        close: number;
+        slTickPrice: number;
+        maxBuyPrice: number;
+      }[] = [];
+
+      stocksOnly.forEach((d, i) => {
+        const m = metrics[i];
+        const stale = d.date < latest;
+        if (!m || stale || Number(d.volume) <= 0 || Number(d.trend) !== 1) return;
+        if (m.avgValue20 < MIN_AVG_VALUE) return;
+        const rsVal = pm.get(d.ticker) ?? null;
+        const res = scoreMetrics(m, rsVal);
+        if (!res || !res.eligible || res.total < 86) return;
+
+        const close = Number(d.close);
+        const stLine = m.stLine ?? (d.line !== null && d.line !== undefined ? Number(d.line) : null);
+        if (stLine === null) return;
+        const slTickPrice = floorToIdxTick(stLine, 1);
+        const slRiskPct = close > 0 ? ((slTickPrice - close) / close) * 100 : null;
+        if (slRiskPct !== null && slRiskPct < -8) return;
+
+        picks.push({
+          ticker: d.ticker,
+          score: res.total,
+          close,
+          slTickPrice,
+          maxBuyPrice: floorToIdxTick(close * 1.015, 0),
+        });
+      });
+      picks.sort((a, b) => b.score - a.score);
+      setScreenerTopPicks(picks);
+
+      // Ambil histori candlestick untuk seluruh ticker posisi OPEN
       const openTickers = Array.from(new Set(list.filter((p) => p.status === "OPEN").map((p) => p.ticker)));
       if (openTickers.length > 0) {
         const results = await Promise.all(
@@ -118,16 +201,85 @@ export default function PortfolioManager() {
 
   // Urutkan posisi OPEN: yang kritis / perlu aksi tampil lebih dulu
   const enrichedOpen: EnrichedPosition[] = useMemo(() => {
-    return positions
-      .filter((p) => p.status === "OPEN")
+    const openOnly = positions.filter((p) => p.status === "OPEN");
+    return openOnly
       .map((pos) => {
         const bars = barsMap[pos.ticker] ?? [];
         const st = bars.length >= ST_PERIOD ? supertrend(bars, ST_PERIOD, ST_MULT) : [];
-        const advice = evaluatePosition(pos, bars, st);
+        const sameTickerPositions = openOnly.filter((x) => x.ticker === pos.ticker);
+        const advice = evaluatePosition(pos, bars, st, {
+          ihsgBullish,
+          prefs,
+          sameTickerPositions,
+        });
         return { pos, advice };
       })
       .sort((a, b) => (a.advice?.healthScore ?? 50) - (b.advice?.healthScore ?? 50));
-  }, [positions, barsMap]);
+  }, [positions, barsMap, ihsgBullish, prefs]);
+
+  const openTickerSet = useMemo(
+    () => new Set(enrichedOpen.map((x) => x.pos.ticker)),
+    [enrichedOpen]
+  );
+
+  // Kandidat antrean beli besok pagi (yang belum dipegang) untuk Morning Action Sheet
+  const morningBuyCandidates: MorningBuyCandidate[] = useMemo(() => {
+    return screenerTopPicks
+      .filter((p) => !openTickerSet.has(p.ticker))
+      .map((p) => {
+        const sizing = computePositionSizing({
+          entryPrice: p.close,
+          stopLossPrice: p.slTickPrice,
+          prefs,
+          ihsgBullish,
+        });
+        return {
+          ticker: p.ticker,
+          score: p.score,
+          close: p.close,
+          maxBuyLimit: p.maxBuyPrice,
+          orderSl: p.slTickPrice,
+          lots: sizing.lots,
+          estimatedCostRp: sizing.estimatedCostRp,
+        };
+      })
+      .filter((c) => c.lots > 0);
+  }, [screenerTopPicks, openTickerSet, prefs, ihsgBullish]);
+
+  const actionSheetText = useMemo(() => {
+    return buildMorningActionText({
+      dateLabel: latestMarketDate ? fmtDate(latestMarketDate) : undefined,
+      ihsgBullish,
+      openAdvices: enrichedOpen,
+      buyCandidates: morningBuyCandidates,
+      maxPositions: prefs.maxPositions,
+    });
+  }, [latestMarketDate, ihsgBullish, enrichedOpen, morningBuyCandidates, prefs.maxPositions]);
+
+  async function copyActionSheet() {
+    try {
+      await navigator.clipboard.writeText(actionSheetText);
+      setCopiedSheet(true);
+      setTimeout(() => setCopiedSheet(false), 2500);
+    } catch {
+      /* abaikan */
+    }
+  }
+
+  // Kalkulasi bantuan Position Sizing langsung saat user mengetik Harga Beli & SL di form Tambah Posisi
+  const addFormSizingHint = useMemo(() => {
+    const pNum = Number(buyPrice.replace(/\./g, "").replace(",", "."));
+    const sNum = Number(slInstalled.replace(/\./g, "").replace(",", "."));
+    if (!Number.isFinite(pNum) || pNum <= 0 || !Number.isFinite(sNum) || sNum <= 0 || sNum >= pNum) {
+      return null;
+    }
+    return computePositionSizing({
+      entryPrice: pNum,
+      stopLossPrice: floorToIdxTick(sNum, 0),
+      prefs,
+      ihsgBullish,
+    });
+  }, [buyPrice, slInstalled, prefs, ihsgBullish]);
 
   const closedList = useMemo(() => positions.filter((p) => p.status === "CLOSED"), [positions]);
   const perfStats = useMemo(() => computePerformanceStats(closedList), [closedList]);
@@ -238,6 +390,7 @@ export default function PortfolioManager() {
           status: "CLOSED",
           sell_date: sellDate,
           sell_price: sPrice,
+          exit_reason: exitReason,
         })
         .eq("id", closingPos.pos.id);
       if (error) throw new Error(error.message);
@@ -264,28 +417,51 @@ export default function PortfolioManager() {
     }
   }
 
+  const freeSlots = Math.max(0, prefs.maxPositions - openTickerSet.size);
+
   return (
     <div className="space-y-5">
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
             <Link href="/" className="text-sm text-slate-500 hover:text-slate-800">
               ← Screener
             </Link>
             <h1 className="text-xl font-bold tracking-tight md:text-2xl">Portofolio & Aksi Besok</h1>
+            {ihsgBullish !== null && (
+              <span
+                className={`rounded-full px-2.5 py-0.5 text-xs font-bold ${
+                  ihsgBullish ? "bg-emerald-100 text-emerald-800" : "bg-rose-100 text-rose-800"
+                }`}
+              >
+                {ihsgBullish ? "IHSG Bullish · Porsi 100%" : "IHSG Bearish · Porsi 50%"}
+              </span>
+            )}
           </div>
           <p className="mt-0.5 text-xs text-slate-500 md:text-sm">
-            Evaluasi otomatis posisi terbuka berdasarkan Supertrend ATR {ST_PERIOD} (mult {ST_MULT}) & horizon 10–20 hari bursa.
+            Evaluasi otomatis posisi terbuka (Supertrend ATR {ST_PERIOD}, mult {ST_MULT}) · Slot aktif{" "}
+            <b>
+              {openTickerSet.size}/{prefs.maxPositions}
+            </b>{" "}
+            ({freeSlots > 0 ? `sisa ${freeSlots} slot` : "penuh"}).
           </p>
         </div>
 
-        <button
-          onClick={() => setShowAdd((v) => !v)}
-          className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700"
-        >
-          {showAdd ? "Tutup Form" : "+ Catat Beli Baru"}
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => setShowActionSheet(true)}
+            className="rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
+          >
+            Morning Action Sheet
+          </button>
+          <button
+            onClick={() => setShowAdd((v) => !v)}
+            className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700"
+          >
+            {showAdd ? "Tutup Form" : "+ Catat Beli Baru"}
+          </button>
+        </div>
       </div>
 
       {err && (
@@ -300,7 +476,19 @@ export default function PortfolioManager() {
           onSubmit={handleAddPosition}
           className="space-y-4 rounded-2xl border border-emerald-200 bg-white p-4 shadow-sm md:p-5"
         >
-          <h2 className="text-sm font-bold text-slate-800">Catat Transaksi Beli Baru</h2>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-bold text-slate-800">Catat Transaksi Beli Baru</h2>
+            {tickerInput.trim() && openTickerSet.has(
+              tickerInput.trim().toUpperCase().endsWith(".JK")
+                ? tickerInput.trim().toUpperCase()
+                : `${tickerInput.trim().toUpperCase()}.JK`
+            ) && (
+              <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-bold text-amber-800">
+                Catatan: Saham ini sudah ada di portofolio (Pastikan statusnya SIAP ADD-ON)
+              </span>
+            )}
+          </div>
+
           <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-5">
             <label className="block">
               <span className="mb-1 block text-xs font-medium text-slate-600">Ticker</span>
@@ -355,6 +543,25 @@ export default function PortfolioManager() {
               />
             </label>
           </div>
+
+          {/* Saran Lot Ideal Otomatis berdasarkan Harga Beli & SL Terpasang */}
+          {addFormSizingHint && addFormSizingHint.lots > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-emerald-50/80 px-3.5 py-2 text-xs text-emerald-900">
+              <span>
+                Saran Position Sizing ({ihsgBullish === false ? "IHSG Bearish 50%" : "IHSG Bullish 100%"}):{" "}
+                <b>{addFormSizingHint.lots} Lot</b> (~Rp {fmtInt.format(addFormSizingHint.estimatedCostRp)} · Risiko SL Rp{" "}
+                {fmtInt.format(addFormSizingHint.actualRiskRp)})
+              </span>
+              <button
+                type="button"
+                onClick={() => setLots(String(addFormSizingHint.lots))}
+                className="rounded-lg bg-emerald-600 px-2.5 py-1 font-semibold text-white hover:bg-emerald-700"
+              >
+                Pakai {addFormSizingHint.lots} Lot
+              </button>
+            </div>
+          )}
+
           <div className="flex flex-wrap items-center justify-between gap-3">
             <input
               value={notes}
@@ -376,7 +583,7 @@ export default function PortfolioManager() {
       {/* Kartu Ringkasan Portofolio */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <div className="rounded-2xl border border-slate-200 bg-white p-4">
-          <div className="text-xs font-medium text-slate-500">Modal Aktif ({enrichedOpen.length} saham)</div>
+          <div className="text-xs font-medium text-slate-500">Modal Aktif ({enrichedOpen.length} posisi)</div>
           <div className="mt-1 text-lg font-bold tabular-nums text-slate-900 md:text-xl">
             Rp {fmtInt.format(totals.modal)}
           </div>
@@ -741,6 +948,26 @@ export default function PortfolioManager() {
                         ✓ Konfirmasi SL Sudah Digeser ke Rp {fmtInt.format(advice.suggestedSl)}
                       </button>
                     )}
+
+                    {/* Tombol Pintasan Catat Add-On jika posisi sudah memenuhi syarat SIAP ADD-ON */}
+                    {advice && advice.addOnReady && advice.addOnSuggestedLots > 0 && (
+                      <button
+                        onClick={() => {
+                          setTickerInput(cleanTicker);
+                          setBuyDate(new Date().toISOString().slice(0, 10));
+                          setBuyPrice(String(floorToIdxTick(advice.currentPrice)));
+                          setLots(String(advice.addOnSuggestedLots));
+                          setSlInstalled(advice.suggestedSl ? String(advice.suggestedSl) : "");
+                          setNotes("Add-on (posisi awal sudah zero risk)");
+                          setShowAdd(true);
+                          window.scrollTo({ top: 0, behavior: "smooth" });
+                        }}
+                        className="rounded-xl border border-emerald-300 bg-emerald-50 px-3.5 py-2 text-xs font-semibold text-emerald-900 hover:bg-emerald-100"
+                      >
+                        + Catat Add-On ({advice.addOnSuggestedLots} Lot)
+                      </button>
+                    )}
+
                     <button
                       onClick={() => {
                         setClosingPos({ pos, advice });
@@ -749,6 +976,15 @@ export default function PortfolioManager() {
                           advice
                             ? String(floorToIdxTick(advice.currentPrice))
                             : String(pos.buy_price)
+                        );
+                        setExitReason(
+                          advice?.code === "EXIT_STOP"
+                            ? "SIGNAL_EXIT"
+                            : advice?.code === "TIME_STOP"
+                            ? "TIME_STOP"
+                            : advice?.code === "EXTENDED_PROFIT" || advice?.code === "PARABOLIC_SPIKE"
+                            ? "TAKE_PROFIT"
+                            : "AUTO_SL"
                         );
                       }}
                       className="rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
@@ -802,6 +1038,7 @@ export default function PortfolioManager() {
                   <th className="px-3 py-2 text-right">Lot</th>
                   <th className="px-3 py-2 text-right">Beli</th>
                   <th className="px-3 py-2 text-right">Jual</th>
+                  <th className="px-3 py-2">Alasan Keluar</th>
                   <th className="px-3 py-2 text-right">Realized P/L</th>
                 </tr>
               </thead>
@@ -819,6 +1056,9 @@ export default function PortfolioManager() {
                       <td className="px-3 py-2 text-right tabular-nums">{c.lots}</td>
                       <td className="px-3 py-2 text-right tabular-nums">{fmtInt.format(c.buy_price)}</td>
                       <td className="px-3 py-2 text-right tabular-nums">{fmtInt.format(sPrice)}</td>
+                      <td className="px-3 py-2 text-slate-500">
+                        {c.exit_reason ? (EXIT_REASON_LABELS[c.exit_reason] ?? c.exit_reason) : "–"}
+                      </td>
                       <td className={`px-3 py-2 text-right font-semibold tabular-nums ${pnl >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
                         {pnl >= 0 ? "+" : ""}
                         {fmtInt.format(pnl)} ({pct >= 0 ? "+" : ""}{fmtDec.format(pct)}%)
@@ -870,6 +1110,21 @@ export default function PortfolioManager() {
               </label>
             </div>
 
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">Alasan Keluar</span>
+              <select
+                value={exitReason}
+                onChange={(e) => setExitReason(e.target.value as ExitReason)}
+                className={inputCls}
+              >
+                {EXIT_REASON_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
             {closePreview && (
               <div className="flex items-center justify-between rounded-xl bg-slate-50 px-3.5 py-2.5 text-xs">
                 <span className="text-slate-600">Estimasi Realized P/L:</span>
@@ -902,6 +1157,54 @@ export default function PortfolioManager() {
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {/* Modal Morning Action Sheet */}
+      {showActionSheet && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+          onClick={() => setShowActionSheet(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-2xl space-y-4 rounded-2xl bg-white p-5 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Morning Action Sheet · Rencana Besok Pagi</h3>
+                <p className="text-xs text-slate-500">
+                  Prioritas Jual/Exit, Update Trailing SL, dan Antrean Beli Top Pick sesuai sisa slot ({freeSlots}/
+                  {prefs.maxPositions}).
+                </p>
+              </div>
+              <button
+                onClick={() => setShowActionSheet(false)}
+                className="rounded-lg px-2 py-1 text-sm text-slate-400 hover:text-slate-700"
+              >
+                ✕
+              </button>
+            </div>
+
+            <pre className="max-h-96 overflow-y-auto whitespace-pre-wrap rounded-xl bg-slate-900 p-4 font-mono text-xs leading-relaxed text-slate-100">
+              {actionSheetText}
+            </pre>
+
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setShowActionSheet(false)}
+                className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-semibold text-slate-600"
+              >
+                Tutup
+              </button>
+              <button
+                onClick={copyActionSheet}
+                className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
+              >
+                {copiedSheet ? "✓ Tersalin ke Clipboard!" : "Salin Semua Order Besok"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

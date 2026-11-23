@@ -39,18 +39,32 @@ export function scoreMetrics(m: Metrics, rs: number | null, minValue: number = M
   // 2) Risk/reward (bobot 0, tetap dihitung untuk laporan IC backtest)
   add("rr", "Risk/reward", m.rr === null ? 0 : ramp(m.rr, 0, 3), `R:R ${f(m.rr)} (target high 20 hari)`);
 
-  // 3) Kualitas tren
+  // 3) Kualitas tren + Deteksi Sideways / Whipsaw
   const ema = m.aboveEma50 === null ? 0.5 : m.aboveEma50 ? 1 : 0;
-  const adx = m.adx === null ? 0.5 : ramp(m.adx, 15, 25);
+  const adx = m.adx === null ? 0.5 : ramp(m.adx, 16, 28);
   const hl = m.higherLow === null ? 0.5 : m.higherLow ? 1 : 0;
-  add(
-    "trendQuality",
-    "Kualitas tren",
-    (ema + adx + hl) / 3,
-    `${m.aboveEma50 === null ? "EMA50 –" : m.aboveEma50 ? "di atas EMA50" : "di bawah EMA50"}, ADX ${f(m.adx, 0)}, ${
-      m.higherLow === null ? "HL –" : m.higherLow ? "higher low" : "lower low"
-    }`
-  );
+  const er = m.er30 == null ? null : ramp(m.er30, 0.15, 0.4); // 0.15 = sideways, >=0.40 = tren lurus
+  const flipScore = m.flips60 == null ? null : 1 - ramp(m.flips60, 2, 5); // <=2 flip = bersih, >=5 flip = choppy
+
+  const trendComponents = [ema, adx, hl];
+  if (er !== null) trendComponents.push(er);
+  if (flipScore !== null) trendComponents.push(flipScore);
+  const trendFraction = trendComponents.reduce((s, v) => s + v, 0) / trendComponents.length;
+
+  const choppyFlags: string[] = [];
+  if (m.aboveEma50 === false) choppyFlags.push("di bawah EMA50");
+  if (m.flips60 != null && m.flips60 >= 4) choppyFlags.push(`${m.flips60}x flip/60h (whipsaw)`);
+  if (m.er30 != null && m.er30 < 0.2) choppyFlags.push(`ER ${m.er30.toFixed(2)} (sideways)`);
+  if (m.adx !== null && m.adx < 18) choppyFlags.push(`ADX lemah (${f(m.adx, 0)})`);
+
+  const trendSummary =
+    choppyFlags.length > 0
+      ? `Waspada sideways: ${choppyFlags.join(", ")}`
+      : `${m.aboveEma50 === null ? "EMA50 –" : "di atas EMA50"}, ADX ${f(m.adx, 0)}, ${
+          m.higherLow === null ? "HL –" : m.higherLow ? "higher low" : "lower low"
+        }${m.flips60 != null ? `, ${m.flips60}x flip` : ""}`;
+
+  add("trendQuality", "Kualitas tren", trendFraction, trendSummary);
 
   // 4) Umur tren
   const age = m.barsInTrend;
@@ -95,7 +109,21 @@ export function scoreMetrics(m: Metrics, rs: number | null, minValue: number = M
 
   const totalWeight = parts.reduce((s, p) => s + p.weight, 0);
   const rawScore = parts.reduce((s, p) => s + p.weight * p.fraction, 0);
-  const total = totalWeight > 0 ? Math.round((rawScore / totalWeight) * 100) : 0;
+  let score = totalWeight > 0 ? (rawScore / totalWeight) * 100 : 0;
+
+  // Penalti struktural agar saham sideways/downtrend tidak lolos ke Top Pick (>= 86)
+  let structureMultiplier = 1;
+  if (m.aboveEma50 === false) structureMultiplier *= 0.82; // masih di bawah rata-rata 50 hari
+  if (m.ret60 !== null && m.ret60 <= 0) structureMultiplier *= 0.88; // return 3 bulan masih minus/stagnan
+  if (m.flips60 != null && m.flips60 >= 4) {
+    // makin sering bolak-balik BUY/SELL, makin besar pemotongan skor
+    structureMultiplier *= Math.max(0.7, 1 - (m.flips60 - 3) * 0.08);
+  }
+  if (m.er30 != null && m.er30 < 0.18) {
+    structureMultiplier *= 0.85; // gerak harga bolak-balik (efficiency ratio rendah)
+  }
+
+  const total = Math.round(score * structureMultiplier);
 
   let reason: string | null = null;
   if (m.trend !== 1) reason = "Tren bearish";

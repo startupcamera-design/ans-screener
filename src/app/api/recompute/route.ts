@@ -78,6 +78,8 @@ export async function POST(req: NextRequest) {
         atr_pct: rn(m.atrPct, 4),
         pattern: m.pattern,
         pattern_age: m.patternAge,
+        flips60: m.flips60 ?? null,
+        er30: rn(m.er30 ?? null, 4),
       });
     }
     for (const p of res.slice(-keep)) {

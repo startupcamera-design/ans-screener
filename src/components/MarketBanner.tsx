@@ -17,9 +17,11 @@ type Props = {
   /** jumlah saham bullish dan total saham aktif (untuk "breadth" pasar) */
   bull: number;
   total: number;
+  /** callback opsional untuk memberitahu komponen induk (mis. Screener) status tren IHSG */
+  onRegimeChange?: (ihsgBullish: boolean | null) => void;
 };
 
-export default function MarketBanner({ bull, total }: Props) {
+export default function MarketBanner({ bull, total, onRegimeChange }: Props) {
   const [bars, setBars] = useState<VBar[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -74,6 +76,15 @@ export default function MarketBanner({ bull, total }: Props) {
     };
   }, [bars]);
 
+  useEffect(() => {
+    if (!onRegimeChange) return;
+    if (!calc) {
+      onRegimeChange(null);
+      return;
+    }
+    onRegimeChange(calc.trend === 1);
+  }, [calc, onRegimeChange]);
+
   if (bars === null) {
     return <div className="h-44 animate-pulse rounded-2xl border border-slate-200 bg-white" role="status" aria-label="Memuat IHSG" />;
   }
@@ -97,14 +108,14 @@ export default function MarketBanner({ bull, total }: Props) {
   const nearFlip = bullish && calc.dist < 1.2;
   const breadth = total > 0 ? (bull / total) * 100 : null;
 
-  // Panduan porsi modal berdasarkan rezim IHSG, jarak ke garis SL indeks, & breadth pasar
+  // Panduan porsi modal & sizing berdasarkan rezim IHSG, jarak ke garis SL indeks, & breadth pasar
   const regimeAdvice = !bullish
-    ? "Rezim IHSG bearish — kurangi agresi (maks 2–3 slot) hanya pada Top Pick (≥ 86) dan patuhi SL otomatis."
+    ? "Rezim IHSG BEARISH (Defensif) — ukuran lot otomatis dipotong 50% (setengah porsi); hanya ambil Top Pick (≥ 86) dan patuhi SL otomatis."
     : nearFlip
-    ? `IHSG bullish tapi tipis (${pct(calc.dist, true)} di atas garis) — waspada potensi flip bearish; batasi 3–4 slot.`
+    ? `IHSG bullish tapi tipis (${pct(calc.dist, true)} di atas garis) — waspada potensi flip bearish; gunakan porsi 100% secara selektif (maks 3–4 slot).`
     : breadth === null || breadth >= 45
-    ? "Rezim kondusif — siap alokasi penuh (4–5 slot) pada Top Pick (≥ 86)."
-    : "IHSG bullish tapi selektif — fokus hanya pada Top Pick (≥ 86) ber-RS tinggi.";
+    ? "Rezim IHSG BULLISH (Risk-On) — ukuran lot aktif 100% standar untuk alokasi penuh pada Top Pick (≥ 86)."
+    : "IHSG bullish tapi selektif — ukuran lot 100% hanya untuk Top Pick (≥ 86) ber-RS tinggi.";
 
   return (
     <section
@@ -137,7 +148,7 @@ export default function MarketBanner({ bull, total }: Props) {
             <span
               className={`inline-flex items-center gap-2 whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-bold text-white md:px-4 md:py-2 md:text-sm ${bullish ? "bg-emerald-600" : "bg-rose-600"}`}
             >
-              {bullish ? "▲ BULLISH" : "▼ BEARISH"}
+              {bullish ? "▲ BULLISH · Porsi 100%" : "▼ BEARISH · Porsi 50%"}
             </span>
             {calc.signal && (
               <span className="ml-2 rounded bg-slate-900 px-2 py-1 text-xs font-bold text-white">{calc.signal} baru</span>

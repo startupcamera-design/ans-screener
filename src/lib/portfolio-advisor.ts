@@ -1,6 +1,29 @@
 import type { VBar } from "./metrics";
 import type { STPoint } from "./supertrend";
 
+export type ExitReason =
+  | "AUTO_SL"
+  | "SIGNAL_EXIT"
+  | "TIME_STOP"
+  | "TAKE_PROFIT"
+  | "MANUAL";
+
+export const EXIT_REASON_LABELS: Record<ExitReason, string> = {
+  AUTO_SL: "Kena Auto-SL",
+  SIGNAL_EXIT: "Sinyal Exit Supertrend",
+  TIME_STOP: "Time-Stop (> 20 Hari Bursa)",
+  TAKE_PROFIT: "Take Profit",
+  MANUAL: "Jual Manual / Rotasi",
+};
+
+export const EXIT_REASON_OPTIONS: { value: ExitReason; label: string }[] = [
+  { value: "AUTO_SL", label: EXIT_REASON_LABELS.AUTO_SL },
+  { value: "SIGNAL_EXIT", label: EXIT_REASON_LABELS.SIGNAL_EXIT },
+  { value: "TIME_STOP", label: EXIT_REASON_LABELS.TIME_STOP },
+  { value: "TAKE_PROFIT", label: EXIT_REASON_LABELS.TAKE_PROFIT },
+  { value: "MANUAL", label: EXIT_REASON_LABELS.MANUAL },
+];
+
 export type PositionRow = {
   id: string;
   ticker: string;
@@ -12,6 +35,7 @@ export type PositionRow = {
   status: "OPEN" | "CLOSED";
   sell_date: string | null;
   sell_price: number | null;
+  exit_reason?: ExitReason | null;
 };
 
 export type ActionCode =
@@ -56,6 +80,8 @@ export type PositionAdvice = {
   marketValue: number;
   slRiskFromCurrentPct: number;
   isBreakevenOrBetter: boolean;
+  addOnReady: boolean;
+  addOnSuggestedLots: number;
 };
 
 /** Aturan fraksi harga saham reguler BEI */
@@ -81,6 +107,128 @@ export function floorToIdxTick(price: number, subtractTicks = 0): number {
     }
   }
   return Math.max(1, p);
+}
+
+/** Pengaturan Modal, Manajemen Risiko & Batas Slot Portofolio (disimpan di localStorage) */
+export type TradingPrefs = {
+  capitalRp: number; // Total modal trading (default Rp 100.000.000)
+  riskPerTradePct: number; // Maksimal risiko rugi per posisi dalam % modal (default 1%)
+  maxPositions: number; // Maksimal jumlah saham aktif bersamaan (default 5)
+};
+
+export const DEFAULT_TRADING_PREFS: TradingPrefs = {
+  capitalRp: 100_000_000,
+  riskPerTradePct: 1.0,
+  maxPositions: 5,
+};
+
+const PREFS_STORAGE_KEY = "st_screener_trading_prefs_v1";
+
+export function loadTradingPrefs(): TradingPrefs {
+  if (typeof window === "undefined") return DEFAULT_TRADING_PREFS;
+  try {
+    const raw = window.localStorage.getItem(PREFS_STORAGE_KEY);
+    if (!raw) return DEFAULT_TRADING_PREFS;
+    const parsed = JSON.parse(raw);
+    return {
+      capitalRp:
+        Number.isFinite(Number(parsed.capitalRp)) && Number(parsed.capitalRp) > 0
+          ? Number(parsed.capitalRp)
+          : DEFAULT_TRADING_PREFS.capitalRp,
+      riskPerTradePct:
+        Number.isFinite(Number(parsed.riskPerTradePct)) &&
+        Number(parsed.riskPerTradePct) > 0 &&
+        Number(parsed.riskPerTradePct) <= 10
+          ? Number(parsed.riskPerTradePct)
+          : DEFAULT_TRADING_PREFS.riskPerTradePct,
+      maxPositions:
+        Number.isInteger(Number(parsed.maxPositions)) &&
+        Number(parsed.maxPositions) >= 1 &&
+        Number(parsed.maxPositions) <= 20
+          ? Number(parsed.maxPositions)
+          : DEFAULT_TRADING_PREFS.maxPositions,
+    };
+  } catch {
+    return DEFAULT_TRADING_PREFS;
+  }
+}
+
+export function saveTradingPrefs(prefs: TradingPrefs): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(prefs));
+  } catch {
+    // Abaikan jika storage penuh / mode privat
+  }
+}
+
+export type PositionSizingResult = {
+  lots: number;
+  shares: number;
+  estimatedCostRp: number;
+  maxRiskAllowedRp: number;
+  actualRiskRp: number;
+  riskPerShareRp: number;
+  allocationPct: number;
+  regimeMultiplier: number; // 1.0 jika IHSG Bullish, 0.5 jika IHSG Bearish
+  cappedBySlotBudget: boolean;
+};
+
+/**
+ * Menghitung ukuran lot ideal berbasis risiko modal, jarak Stop Loss BEI,
+ * alokasi maksimal per slot portofolio, dan rezim IHSG (100% Bullish vs 50% Bearish).
+ */
+export function computePositionSizing(params: {
+  entryPrice: number;
+  stopLossPrice: number;
+  prefs: TradingPrefs;
+  ihsgBullish: boolean | null;
+}): PositionSizingResult {
+  const { entryPrice, stopLossPrice, prefs, ihsgBullish } = params;
+  const regimeMultiplier = ihsgBullish === false ? 0.5 : 1.0;
+
+  if (entryPrice <= 0 || stopLossPrice <= 0 || entryPrice <= stopLossPrice) {
+    return {
+      lots: 0,
+      shares: 0,
+      estimatedCostRp: 0,
+      maxRiskAllowedRp: 0,
+      actualRiskRp: 0,
+      riskPerShareRp: 0,
+      allocationPct: 0,
+      regimeMultiplier,
+      cappedBySlotBudget: false,
+    };
+  }
+
+  const effectiveCapital = prefs.capitalRp * regimeMultiplier;
+  const maxRiskAllowedRp = effectiveCapital * (prefs.riskPerTradePct / 100);
+  const riskPerShareRp = entryPrice - stopLossPrice;
+  const riskPerLotRp = riskPerShareRp * 100;
+
+  const lotsByRisk = Math.floor(maxRiskAllowedRp / riskPerLotRp);
+
+  const maxAllocationPerSlotRp = effectiveCapital / Math.max(1, prefs.maxPositions);
+  const costPerLotRp = entryPrice * 100;
+  const lotsBySlot = Math.floor(maxAllocationPerSlotRp / costPerLotRp);
+
+  const lots = Math.max(0, Math.min(lotsByRisk, lotsBySlot));
+  const shares = lots * 100;
+  const estimatedCostRp = shares * entryPrice;
+  const actualRiskRp = shares * riskPerShareRp;
+  const allocationPct = prefs.capitalRp > 0 ? (estimatedCostRp / prefs.capitalRp) * 100 : 0;
+
+  return {
+    lots,
+    shares,
+    estimatedCostRp,
+    maxRiskAllowedRp,
+    actualRiskRp,
+    riskPerShareRp,
+    allocationPct,
+    regimeMultiplier,
+    cappedBySlotBudget: lotsBySlot < lotsByRisk && lots > 0,
+  };
 }
 
 /** Hitung Skor Kesehatan Posisi (0–100) beserta rincian penyebabnya */
@@ -295,6 +443,12 @@ function computeHealthScore(params: {
   };
 }
 
+export type EvaluatePositionContext = {
+  ihsgBullish?: boolean | null;
+  prefs?: TradingPrefs;
+  sameTickerPositions?: PositionRow[];
+};
+
 /**
  * Mengevaluasi posisi terbuka berdasarkan data bar harian & Supertrend terbaru
  * untuk menghasilkan rekomendasi tindakan spesifik besok pagi + skor kesehatan.
@@ -302,9 +456,14 @@ function computeHealthScore(params: {
 export function evaluatePosition(
   pos: PositionRow,
   bars: VBar[],
-  st: STPoint[]
+  st: STPoint[],
+  ctx?: EvaluatePositionContext
 ): PositionAdvice | null {
   if (bars.length === 0 || st.length === 0) return null;
+
+  const ihsgBullish = ctx?.ihsgBullish ?? null;
+  const prefs = ctx?.prefs ?? DEFAULT_TRADING_PREFS;
+  const sameTickerCount = ctx?.sameTickerPositions?.length ?? 1;
 
   const lastBar = bars[bars.length - 1];
   const prevBar = bars.length >= 2 ? bars[bars.length - 2] : null;
@@ -363,6 +522,33 @@ export function evaluatePosition(
     lastBar.low <= pos.sl_installed &&
     currentPrice > pos.sl_installed;
 
+  // Hitung kesiapan Add-On (Pyramiding)
+  const addOnReady =
+    isBullish &&
+    !closeBreachedSl &&
+    !intradayTouchedSl &&
+    sameTickerCount === 1 &&
+    ihsgBullish !== false &&
+    isBreakevenOrBetter &&
+    pnlPct >= 5 &&
+    pnlPct <= 14 &&
+    holdingBars >= 3 &&
+    holdingBars <= 12 &&
+    distAtr >= 0.6 &&
+    distAtr <= 2.0 &&
+    !heavyDistribution;
+
+  const addOnSizing =
+    addOnReady && suggestedSl !== null
+      ? computePositionSizing({
+          entryPrice: currentPrice,
+          stopLossPrice: suggestedSl,
+          prefs,
+          ihsgBullish,
+        })
+      : null;
+  const addOnSuggestedLots = addOnSizing ? Math.max(0, Math.floor(addOnSizing.lots * 0.5)) : 0;
+
   const health = computeHealthScore({
     isBullish,
     closeBreachedSl,
@@ -398,6 +584,8 @@ export function evaluatePosition(
     marketValue,
     slRiskFromCurrentPct,
     isBreakevenOrBetter,
+    addOnReady: addOnReady && addOnSuggestedLots > 0,
+    addOnSuggestedLots,
   };
 
   // 1. PRIORITAS TERTINGGI: Tren berbalik Bearish atau Close tembus SL terpasang
@@ -532,7 +720,7 @@ export function evaluatePosition(
     };
   }
 
-  // 8. PRIORITAS KEDELAPAN: Tekanan koreksi tajam mendekati SL (< 1.5% jarak ke SL)
+  // 8. PRIORITAS KEDELAPAN: Tekanan koreksi tajam mendekati SL (< 1.8% jarak ke SL)
   const distToActiveSlPct =
     pos.sl_installed && currentPrice > 0
       ? ((currentPrice - pos.sl_installed) / currentPrice) * 100
@@ -586,25 +774,16 @@ export function evaluatePosition(
     };
   }
 
-  // 11. PRIORITAS KESEBELAS: Kandidat Pyramiding / Add-on (Sudah Zero Risk, tren segar, jarak 0.6–2.0 ATR)
-  if (
-    isBreakevenOrBetter &&
-    pnlPct >= 5 &&
-    pnlPct <= 14 &&
-    holdingBars >= 3 &&
-    holdingBars <= 12 &&
-    distAtr >= 0.6 &&
-    distAtr <= 2.0 &&
-    !heavyDistribution
-  ) {
+  // 11. PRIORITAS KESEBELAS: Kandidat Pyramiding / Add-on
+  if (addOnReady && addOnSuggestedLots > 0) {
     return {
       ...base,
       code: "PYRAMIDING_READY",
-      badge: "ZERO RISK · Peluang Add-On",
+      badge: "SIAP ADD-ON · Zero Risk",
       badgeCls: "bg-sky-700 text-white",
       borderCls: "border-sky-300",
       headline: `Modal awal sudah aman (SL di atas harga beli) & tren menguat (+${pnlPct.toFixed(1)}%, jarak ${distAtr.toFixed(1)} ATR).`,
-      detail: `Jika slot portofolio masih tersedia dan skor screener emiten ini masih ≥ 86, posisi ini memenuhi syarat untuk pyramiding (tambah muatan kecil) dengan batas SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
+      detail: `Jika slot portofolio masih tersedia dan skor screener emiten ini masih ≥ 86, posisi ini memenuhi syarat untuk pyramiding (+${addOnSuggestedLots} lot) dengan batas SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
       suggestedSl,
     };
   }
@@ -636,25 +815,143 @@ export function evaluatePosition(
   };
 }
 
+/** Pembangun teks Morning Action Sheet gabungan (Jual + Geser SL + Antrean Beli Besok Pagi) */
+export type MorningBuyCandidate = {
+  ticker: string;
+  score: number;
+  close: number;
+  maxBuyLimit: number;
+  orderSl: number;
+  lots: number;
+  estimatedCostRp: number;
+};
+
+export function buildMorningActionText(params: {
+  dateLabel?: string;
+  ihsgBullish: boolean | null;
+  openAdvices: { pos: PositionRow; advice: PositionAdvice | null }[];
+  buyCandidates: MorningBuyCandidate[];
+  maxPositions: number;
+}): string {
+  const { dateLabel, ihsgBullish, openAdvices, buyCandidates, maxPositions } = params;
+  const fmtInt = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 0 });
+  const lines: string[] = [];
+
+  const regimeTxt =
+    ihsgBullish === true
+      ? "IHSG BULLISH (Porsi 100%)"
+      : ihsgBullish === false
+      ? "IHSG BEARISH (Defensif · Porsi 50%)"
+      : "IHSG –";
+
+  lines.push(`=== MORNING ACTION SHEET${dateLabel ? ` (${dateLabel})` : ""} ===`);
+  lines.push(`Rezim Pasar: ${regimeTxt}`);
+  lines.push("");
+
+  // Prioritas 1: Jual / Exit / Time-Stop
+  const exits = openAdvices.filter(
+    (x) =>
+      x.advice &&
+      (x.advice.code === "EXIT_STOP" ||
+        x.advice.code === "CHECK_INTRADAY_SL" ||
+        x.advice.code === "TIME_STOP")
+  );
+  lines.push(`1) PRIORITAS JUAL / EVALUASI KELUAR (${exits.length})`);
+  if (exits.length === 0) {
+    lines.push("   - Tidak ada posisi yang wajib dijual saat open.");
+  } else {
+    let estCash = 0;
+    for (const item of exits) {
+      const clean = item.pos.ticker.replace(/\.JK$/, "");
+      const mv = item.advice?.marketValue ?? item.pos.buy_price * item.pos.lots * 100;
+      if (item.advice?.code !== "CHECK_INTRADAY_SL") estCash += mv;
+      lines.push(
+        `   - ${clean} (${item.pos.lots} Lot): ${item.advice?.badge} | Est. Rp ${fmtInt.format(mv)}`
+      );
+    }
+    if (estCash > 0) {
+      lines.push(`   -> Estimasi kas cair kembali: ~Rp ${fmtInt.format(estCash)}`);
+    }
+  }
+  lines.push("");
+
+  // Prioritas 2: Pasang / Naikkan Auto-SL
+  const slUpdates = openAdvices.filter(
+    (x) =>
+      x.advice &&
+      x.advice.suggestedSl !== null &&
+      x.advice.suggestedSl !== x.pos.sl_installed &&
+      (x.advice.code === "RAISE_SL" ||
+        x.advice.code === "SL_TOO_WIDE" ||
+        x.advice.code === "PARABOLIC_SPIKE" ||
+        x.advice.code === "EXTENDED_PROFIT" ||
+        x.advice.code === "MATURE_TREND_PROFIT")
+  );
+  lines.push(`2) UPDATE AUTO-SL DI SEKURITAS (${slUpdates.length})`);
+  if (slUpdates.length === 0) {
+    lines.push("   - Semua posisi aktif sudah memiliki SL sesuai garis terbaru.");
+  } else {
+    for (const item of slUpdates) {
+      const clean = item.pos.ticker.replace(/\.JK$/, "");
+      const oldSl = item.pos.sl_installed ? `Rp ${fmtInt.format(item.pos.sl_installed)}` : "Belum ada";
+      lines.push(
+        `   - ${clean} (${item.pos.lots} Lot): SL ${oldSl} -> Rp ${fmtInt.format(item.advice!.suggestedSl!)}`
+      );
+    }
+  }
+  lines.push("");
+
+  // Prioritas 3: Antrean Beli Baru
+  const activeCount = openAdvices.filter((x) => x.advice?.code !== "EXIT_STOP").length;
+  const freeSlots = Math.max(0, maxPositions - activeCount);
+  lines.push(`3) ANTREAN BELI BARU (Slot Tersedia: ${freeSlots} dari ${maxPositions})`);
+  if (freeSlots === 0) {
+    lines.push("   - Slot portofolio penuh. Tunggu ada posisi keluar sebelum beli baru.");
+  } else if (buyCandidates.length === 0) {
+    lines.push("   - Belum ada kandidat Top Pick (Skor >= 86 & SL <= 8%) yang memenuhi syarat.");
+  } else {
+    for (const c of buyCandidates.slice(0, freeSlots)) {
+      const clean = c.ticker.replace(/\.JK$/, "");
+      lines.push(
+        `   - ${clean} (Skor ${c.score}): Beli Maks Rp ${fmtInt.format(c.maxBuyLimit)} | ${c.lots} Lot (~Rp ${fmtInt.format(c.estimatedCostRp)}) | Auto-SL Rp ${fmtInt.format(c.orderSl)}`
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
+
+export type ExitReasonSummary = {
+  reason: ExitReason;
+  label: string;
+  count: number;
+  winRatePct: number;
+  avgPnlPct: number;
+  totalPnlRp: number;
+};
+
 export type PerformanceStats = {
   totalTrades: number;
   wins: number;
   losses: number;
   winRatePct: number;
-  realizedNetRp: number; // total penambahan portofolio bersih dari transaksi selesai
+  realizedNetRp: number;
   avgWinPct: number;
   avgLossPct: number;
   avgWinRp: number;
   avgLossRp: number;
-  expectancyPct: number; // rata-rata return bersih per transaksi (%)
-  expectancyRp: number; // rata-rata penambahan Rp per transaksi
-  profitFactor: number | null; // null jika belum pernah loss
+  expectancyPct: number;
+  expectancyRp: number;
+  profitFactor: number | null;
   avgHoldDays: number;
+  slCompliancePct: number | null;
+  oversizedLossesCount: number;
+  byExitReason: ExitReasonSummary[];
   bestTrade: { ticker: string; pnlPct: number; pnlRp: number } | null;
   worstTrade: { ticker: string; pnlPct: number; pnlRp: number } | null;
 };
 
-/** Menghitung Win Rate, Expectancy, dan Penambahan Portofolio Bersih dari riwayat transaksi CLOSED */
+/** Menghitung Win Rate, Expectancy, Kepatuhan SL, dan Penambahan Portofolio Bersih */
 export function computePerformanceStats(closedPositions: PositionRow[]): PerformanceStats {
   const valid = closedPositions.filter(
     (p) => p.status === "CLOSED" && p.sell_price !== null && p.buy_price > 0
@@ -675,6 +972,9 @@ export function computePerformanceStats(closedPositions: PositionRow[]): Perform
       expectancyRp: 0,
       profitFactor: null,
       avgHoldDays: 0,
+      slCompliancePct: null,
+      oversizedLossesCount: 0,
+      byExitReason: [],
       bestTrade: null,
       worstTrade: null,
     };
@@ -690,6 +990,12 @@ export function computePerformanceStats(closedPositions: PositionRow[]): Perform
   let sumWinRp = 0;
   let sumLossRp = 0;
   let totalHoldDays = 0;
+  let oversizedLossesCount = 0;
+
+  const reasonMap = new Map<
+    ExitReason,
+    { count: number; wins: number; sumPct: number; sumRp: number }
+  >();
 
   let bestTrade: { ticker: string; pnlPct: number; pnlRp: number } | null = null;
   let worstTrade: { ticker: string; pnlPct: number; pnlRp: number } | null = null;
@@ -712,9 +1018,20 @@ export function computePerformanceStats(closedPositions: PositionRow[]): Perform
       grossLossRp += Math.abs(pnlRp);
       sumLossPct += Math.abs(pnlPct);
       sumLossRp += Math.abs(pnlRp);
+      if (pnlPct < -8.5) {
+        oversizedLossesCount++;
+      }
     }
 
-    // Hitung durasi hari kalender beli -> jual
+    if (p.exit_reason) {
+      const cur = reasonMap.get(p.exit_reason) ?? { count: 0, wins: 0, sumPct: 0, sumRp: 0 };
+      cur.count++;
+      if (pnlRp > 0) cur.wins++;
+      cur.sumPct += pnlPct;
+      cur.sumRp += pnlRp;
+      reasonMap.set(p.exit_reason, cur);
+    }
+
     if (p.sell_date) {
       const d1 = new Date(p.buy_date).getTime();
       const d2 = new Date(p.sell_date).getTime();
@@ -746,6 +1063,20 @@ export function computePerformanceStats(closedPositions: PositionRow[]): Perform
   const profitFactor = grossLossRp > 0 ? grossProfitRp / grossLossRp : null;
   const avgHoldDays = Math.round(totalHoldDays / totalTrades);
 
+  const slCompliancePct =
+    losses > 0 ? ((losses - oversizedLossesCount) / losses) * 100 : null;
+
+  const byExitReason: ExitReasonSummary[] = Array.from(reasonMap.entries())
+    .map(([reason, st]) => ({
+      reason,
+      label: EXIT_REASON_LABELS[reason] ?? reason,
+      count: st.count,
+      winRatePct: st.count > 0 ? (st.wins / st.count) * 100 : 0,
+      avgPnlPct: st.count > 0 ? st.sumPct / st.count : 0,
+      totalPnlRp: st.sumRp,
+    }))
+    .sort((a, b) => b.count - a.count);
+
   return {
     totalTrades,
     wins,
@@ -760,6 +1091,9 @@ export function computePerformanceStats(closedPositions: PositionRow[]): Perform
     expectancyRp,
     profitFactor,
     avgHoldDays,
+    slCompliancePct,
+    oversizedLossesCount,
+    byExitReason,
     bestTrade,
     worstTrade,
   };
