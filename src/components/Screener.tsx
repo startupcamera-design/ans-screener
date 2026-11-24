@@ -8,12 +8,15 @@ import { Metrics, metricsFromDb } from "@/lib/metrics";
 import { percentileMap, scoreMetrics } from "@/lib/scoring";
 import {
   buildMorningActionText,
+  calcBreakevenLockPrice,
+  calcHardSlPrice,
   ceilToIdxTick,
   computePositionSizing,
   DEFAULT_TRADING_PREFS,
   floorToIdxTick,
   loadTradingPrefs,
   saveTradingPrefs,
+  SOP_BENCHMARK_CONFIG,
   type MorningBuyCandidate,
   type PositionRow,
   type TradingPrefs,
@@ -36,9 +39,10 @@ type Row = {
   ineligibleReason: string | null;
   distAtr: number | null;
   stLine: number | null;
-  slTickPrice: number | null; // garis SL sudah dibulatkan 1 tick BEI ke bawah
+  stTickPrice: number | null; // garis ST dibulatkan 1 tick ke bawah (untuk filter jarak ST <= -8%)
+  hardSlPrice: number; // Hard Auto-SL baku SL-7 (-8% dari close)
   maxBuyPrice: number; // batas limit beli +1.5% dibulatkan ke fraksi BEI
-  slRiskPct: number | null;
+  slRiskPct: number | null; // jarak dari close ke garis ST (filter awal <= -8%)
   rsPct: number | null;
   barsInTrend: number | null;
   avgValue: number | null;
@@ -47,7 +51,7 @@ type Row = {
 
 type HeldInfo = {
   lots: number;
-  isZeroRisk: boolean; // SL terpasang atau garis ST sudah di atas harga beli
+  isZeroRisk: boolean; // Breakeven Lock (+8% -> +0.5%) sudah aktif
 };
 
 type SortKey =
@@ -88,7 +92,7 @@ const DEFAULTS: Filters = {
   maxSlPct: "",
 };
 const DEFAULT_SORT: { key: SortKey; dir: 1 | -1 } = { key: "score", dir: -1 };
-const STORE_KEY = "ans-screener-v3";
+const STORE_KEY = "ans-screener-v4";
 const SORT_KEYS: SortKey[] = [
   "ticker",
   "score",
@@ -103,7 +107,7 @@ const SORT_KEYS: SortKey[] = [
 
 const SORTS: { id: string; label: string; key: SortKey; dir: 1 | -1 }[] = [
   { id: "score", label: "Skor setup tertinggi", key: "score", dir: -1 },
-  { id: "sl", label: "Risiko SL terkecil", key: "slRiskPct", dir: -1 },
+  { id: "sl", label: "Jarak ST terkecil", key: "slRiskPct", dir: -1 },
   { id: "dist", label: "Paling dekat ke garis", key: "distAtr", dir: 1 },
   { id: "up", label: "Naik terbesar", key: "change_pct", dir: -1 },
   { id: "down", label: "Turun terbesar", key: "change_pct", dir: 1 },
@@ -114,19 +118,19 @@ const SORTS: { id: string; label: string; key: SortKey; dir: 1 | -1 }[] = [
 const PRESETS: { id: Preset; label: string; hint: string }[] = [
   {
     id: "prime",
-    label: "Top Pick (≥ 86)",
-    hint: "Kuintil teratas hasil backtest (skor ≥ 86) & bullish. Prioritaskan yang berstatus Risiko SL ≤ 8%; jika > 8%, pantau untuk entry saat pullback.",
+    label: `Top Pick (≥ ${SOP_BENCHMARK_CONFIG.minEntryScore})`,
+    hint: `Patokan Skenario A + SL-7: Skor ≥ ${SOP_BENCHMARK_CONFIG.minEntryScore}, Bullish, usia tren 5–40 bar, dan jarak garis ST ≤ 8%. Pasang Hard SL di -8% saat beli.`,
   },
   { id: "all", label: "Semua", hint: "Semua emiten sesuai filter di bawah." },
   {
     id: "pullback",
-    label: "Dekat garis SL",
-    hint: "Bullish, jarak ke garis Supertrend ≤ 2 ATR, dan tren sudah berjalan ≥ 5 bar (terkonfirmasi). Risiko stop loss pendek.",
+    label: "Dekat garis ST",
+    hint: "Bullish, jarak ke garis Supertrend ≤ 2 ATR, dan tren sudah berjalan ≥ 5 bar (terkonfirmasi).",
   },
   {
     id: "newbuy",
     label: "Sinyal BUY baru",
-    hint: "Supertrend baru berbalik menjadi bullish pada bar terakhir (hati-hati false breakout; ideal tunggu ≥ 5 bar).",
+    hint: "Supertrend baru berbalik menjadi bullish pada bar terakhir (ideal tunggu usia tren 5–40 bar).",
   },
 ];
 
@@ -135,18 +139,24 @@ const idNum = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 2 });
 const idPrice = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 0 });
 const idCompact = new Intl.NumberFormat("id-ID", { notation: "compact", maximumFractionDigits: 1 });
 
-// Tab Top Pick menampilkan semua saham bullish skor >= 86 agar tidak ada kandidat elite yang tersembunyi diam-diam;
-// peringatan SL > 8% ditampilkan jelas di kolom Risiko SL, sedangkan Morning Action Sheet tetap menyaring ketat SL <= 8%.
 const matchPreset = (r: Row, p: Preset) =>
   p === "all"
     ? true
     : p === "prime"
-    ? r.trend === 1 && (r.score ?? 0) >= 86
+    ? r.trend === 1 && (r.score ?? 0) >= SOP_BENCHMARK_CONFIG.minEntryScore
     : p === "pullback"
     ? r.trend === 1 && r.distAtr !== null && r.distAtr <= 2 && (r.barsInTrend ?? 0) >= 5
     : r.signal === "BUY";
 
-const isWideSl = (r: Row) => r.slRiskPct !== null && r.slRiskPct < -8;
+const isWideSt = (r: Row) =>
+  r.slRiskPct !== null && r.slRiskPct < SOP_BENCHMARK_CONFIG.maxInitialSlRiskPct;
+
+const isIdealAge = (r: Row) => {
+  const bars = r.barsInTrend ?? r.days_since_flip;
+  if (bars === null) return false;
+  const [minAge, maxAge] = SOP_BENCHMARK_CONFIG.idealTrendAgeRange;
+  return bars >= minAge && bars <= maxAge;
+};
 
 const parseNum = (s: string) => {
   const t = s.trim();
@@ -164,7 +174,7 @@ export default function Screener() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Pengaturan Modal, Risiko/Trade, & Maks Slot Portofolio
+  // Pengaturan Modal, Risiko/Trade, & Maks Slot Portofolio (Patokan Skenario A)
   const [prefs, setPrefs] = useState<TradingPrefs>(DEFAULT_TRADING_PREFS);
   const [showSizingBar, setShowSizingBar] = useState(false);
   const [capInput, setCapInput] = useState(String(DEFAULT_TRADING_PREFS.capitalRp));
@@ -222,10 +232,22 @@ export default function Screener() {
     const updated: TradingPrefs = {
       capitalRp: cap && cap > 0 ? Math.round(cap) : DEFAULT_TRADING_PREFS.capitalRp,
       riskPerTradePct: risk && risk > 0 && risk <= 10 ? risk : DEFAULT_TRADING_PREFS.riskPerTradePct,
-      maxPositions: Number.isInteger(slots) && slots >= 1 && slots <= 20 ? slots : DEFAULT_TRADING_PREFS.maxPositions,
+      maxPositions: Number.isInteger(slots) && slots >= 1 && slots <= 50 ? slots : DEFAULT_TRADING_PREFS.maxPositions,
     };
     setPrefs(updated);
     saveTradingPrefs(updated);
+    setCapInput(String(updated.capitalRp));
+    setRiskInput(String(updated.riskPerTradePct));
+    setSlotInput(String(updated.maxPositions));
+    setShowSizingBar(false);
+  }
+
+  function handleResetScenarioA() {
+    setPrefs(DEFAULT_TRADING_PREFS);
+    saveTradingPrefs(DEFAULT_TRADING_PREFS);
+    setCapInput(String(DEFAULT_TRADING_PREFS.capitalRp));
+    setRiskInput(String(DEFAULT_TRADING_PREFS.riskPerTradePct));
+    setSlotInput(String(DEFAULT_TRADING_PREFS.maxPositions));
     setShowSizingBar(false);
   }
 
@@ -286,11 +308,15 @@ export default function Screener() {
             const close = Number(d.close);
             const trend = Number(d.trend) as 1 | -1;
             const stLine = m?.stLine ?? (d.line !== null && d.line !== undefined ? Number(d.line) : null);
-            const slTickPrice = trend === 1 && stLine !== null ? floorToIdxTick(stLine, 1) : null;
-            const maxBuyPrice = floorToIdxTick(close * 1.015, 0);
+            const stTickPrice = trend === 1 && stLine !== null ? floorToIdxTick(stLine, 1) : null;
+            const hardSlPrice = calcHardSlPrice(close);
+            const maxBuyPrice = floorToIdxTick(
+              close * (1 + SOP_BENCHMARK_CONFIG.antiFomoMaxGapPct / 100),
+              0
+            );
             const slRiskPct =
-              slTickPrice !== null && close > 0
-                ? ((slTickPrice - close) / close) * 100
+              stTickPrice !== null && close > 0
+                ? ((stTickPrice - close) / close) * 100
                 : m?.slRiskPct ?? null;
 
             return {
@@ -303,13 +329,13 @@ export default function Screener() {
               signal: d.signal,
               days_since_flip: d.days_since_flip === null ? null : Number(d.days_since_flip),
               stale,
-              // Tampilkan skor untuk semua emiten bullish yang punya metrik (selaras dengan halaman detail StockChart)
               score: res && trend === 1 ? res.total : null,
               eligible: res?.eligible ?? false,
               ineligibleReason: res?.reason ?? null,
               distAtr: m?.distAtr ?? null,
               stLine,
-              slTickPrice,
+              stTickPrice,
+              hardSlPrice,
               maxBuyPrice,
               slRiskPct,
               rsPct: rsVal !== undefined ? Math.round(rsVal * 100) : null,
@@ -333,16 +359,16 @@ export default function Screener() {
     return m;
   }, [rows]);
 
-  // Peta saham yang sedang dipegang beserta status Zero Risk (untuk badge SUDAH DIPEGANG vs SIAP ADD-ON)
-const heldMap = useMemo(() => {
+  // Peta saham yang sedang dipegang beserta status Zero Risk (Breakeven Lock +8% -> +0.5%)
+  const heldMap = useMemo(() => {
     const map: Record<string, HeldInfo> = {};
     for (const p of openPositions) {
       const r = rowByTicker.get(p.ticker);
-      const slActive = p.sl_installed ?? r?.slTickPrice ?? null;
       const netBreakeven = ceilToIdxTick(p.buy_price * 1.004);
+      const pnlPct = r && p.buy_price > 0 ? ((r.close - p.buy_price) / p.buy_price) * 100 : 0;
       const isZeroRisk =
-        slActive !== null &&
-        slActive >= netBreakeven &&
+        ((p.sl_installed !== null && p.sl_installed >= netBreakeven) ||
+          pnlPct >= SOP_BENCHMARK_CONFIG.breakevenLockTriggerPct) &&
         r !== undefined &&
         r.trend === 1 &&
         (r.distAtr === null || (r.distAtr >= 0.5 && r.distAtr <= 2.2));
@@ -360,6 +386,8 @@ const heldMap = useMemo(() => {
   const latestDate = useMemo(() => rows.reduce((mx, r) => (r.date > mx ? r.date : mx), ""), [rows]);
   const heldTickerCount = useMemo(() => Object.keys(heldMap).length, [heldMap]);
   const freeSlots = Math.max(0, prefs.maxPositions - heldTickerCount);
+  const slotBudgetRp =
+    (prefs.capitalRp * (ihsgBullish === false ? 0.5 : 1.0)) / Math.max(1, prefs.maxPositions);
 
   const summary = useMemo(() => {
     const live = rows.filter((r) => !r.stale);
@@ -408,7 +436,6 @@ const heldMap = useMemo(() => {
     const list = base.filter((r) => matchPreset(r, f.preset));
     const { key, dir } = sort;
     return list.sort((a, b) => {
-      // Pada tab Top Pick & default sort skor, utamakan yang SL <= 8% lebih dulu bila skornya sama/tinggi
       const av = a[key],
         bv = b[key];
       if (av === null && bv === null) return a.ticker.localeCompare(b.ticker);
@@ -417,11 +444,14 @@ const heldMap = useMemo(() => {
       if (typeof av === "string" && typeof bv === "string") return av.localeCompare(bv) * dir;
       const cmp = ((av as number) - (bv as number)) * dir;
       if (cmp !== 0) return cmp;
-      return Number(isWideSl(a)) - Number(isWideSl(b));
+      // Prioritaskan kandidat yang memenuhi syarat Skenario A (ST <= -8% & usia tren 5-40 bar)
+      const aReady = Number(!isWideSt(a) && isIdealAge(a));
+      const bReady = Number(!isWideSt(b) && isIdealAge(b));
+      return bReady - aReady;
     });
   }, [base, f.preset, sort]);
 
-  // Kandidat antrean beli untuk Morning Action Sheet (ketat: Top Pick >= 86, likuid, SL <= 8%, belum dipegang)
+  // Kandidat antrean beli untuk Morning Action Sheet (Skenario A + SL-7: Skor >= 86, ST <= -8%, Usia Tren 5-40 bar)
   const morningBuyCandidates: MorningBuyCandidate[] = useMemo(() => {
     return rows
       .filter(
@@ -430,16 +460,16 @@ const heldMap = useMemo(() => {
           r.volume > 0 &&
           r.eligible &&
           r.trend === 1 &&
-          (r.score ?? 0) >= 86 &&
-          r.slTickPrice !== null &&
-          (r.slRiskPct === null || r.slRiskPct >= -8) &&
+          (r.score ?? 0) >= SOP_BENCHMARK_CONFIG.minEntryScore &&
+          !isWideSt(r) &&
+          isIdealAge(r) &&
           !heldMap[r.ticker]
       )
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
       .map((r) => {
         const sizing = computePositionSizing({
           entryPrice: r.close,
-          stopLossPrice: r.slTickPrice!,
+          stopLossPrice: r.hardSlPrice,
           prefs,
           ihsgBullish,
         });
@@ -448,7 +478,7 @@ const heldMap = useMemo(() => {
           score: r.score!,
           close: r.close,
           maxBuyLimit: r.maxBuyPrice,
-          orderSl: r.slTickPrice!,
+          orderSl: r.hardSlPrice,
           lots: sizing.lots,
           estimatedCostRp: sizing.estimatedCostRp,
         };
@@ -456,47 +486,82 @@ const heldMap = useMemo(() => {
       .filter((c) => c.lots > 0);
   }, [rows, heldMap, prefs, ihsgBullish]);
 
-  // Teks Morning Action Sheet dari Screener
+  // Ringkasan Morning Action Sheet dari Screener (mengikuti aturan SL-7)
   const actionSheetText = useMemo(() => {
     const pseudoAdvices = openPositions.map((pos) => {
       const r = rowByTicker.get(pos.ticker);
       if (!r) return { pos, advice: null };
+
+      const pnlPct = pos.buy_price > 0 ? ((r.close - pos.buy_price) / pos.buy_price) * 100 : 0;
       const isBearish = r.trend !== 1;
       const closeBreachedSl = pos.sl_installed !== null && r.close <= pos.sl_installed;
-      const needsSl =
-        !isBearish &&
-        r.slTickPrice !== null &&
-        (pos.sl_installed === null || r.slTickPrice > pos.sl_installed);
 
-return {
+      // Aturan SL-7:
+      // - Kena SL terpasang atau Bearish dengan rugi <= -5% -> EXIT_STOP
+      // - Bearish hari ke-1 dengan rugi > -5% -> BEARISH_FLIP_WARN (Tahan 1 hari konfirmasi)
+      // - Belum pasang Hard SL (-8%) atau profit >= +8% namun SL belum di-lock (+0.5%) -> RAISE_SL
+      const hardSl = calcHardSlPrice(pos.buy_price);
+      const beLock = calcBreakevenLockPrice(pos.buy_price);
+      const targetSl =
+        pnlPct >= SOP_BENCHMARK_CONFIG.breakevenLockTriggerPct
+          ? Math.max(hardSl, beLock)
+          : hardSl;
+
+      const isImmediateExit =
+        closeBreachedSl ||
+        (isBearish &&
+          (r.days_since_flip === null ||
+            r.days_since_flip >= SOP_BENCHMARK_CONFIG.bearishFlipConfirmDays ||
+            pnlPct <= SOP_BENCHMARK_CONFIG.bearishFlipImmediateLossPct));
+
+      const isDay1Warn = isBearish && !isImmediateExit;
+      const needsSl =
+        !isImmediateExit &&
+        (pos.sl_installed === null ||
+          (pnlPct >= SOP_BENCHMARK_CONFIG.breakevenLockTriggerPct && pos.sl_installed < beLock));
+
+      return {
         pos,
         advice: {
-          code: isBearish || closeBreachedSl ? ("EXIT_STOP" as const) : needsSl ? ("RAISE_SL" as const) : ("HOLD" as const),
-          badge: isBearish || closeBreachedSl ? "JUAL BESOK · Sinyal Keluar" : needsSl ? "NAIKKAN TRAILING SL" : "HOLD",
+          code: isImmediateExit
+            ? ("EXIT_STOP" as const)
+            : isDay1Warn
+            ? ("BEARISH_FLIP_WARN" as const)
+            : needsSl
+            ? ("RAISE_SL" as const)
+            : ("HOLD" as const),
+          badge: isImmediateExit
+            ? "JUAL BESOK · Konfirmasi SL-7"
+            : isDay1Warn
+            ? "WASPADA HARI KE-1 · Tahan"
+            : needsSl
+            ? pos.sl_installed === null
+              ? "PASANG HARD SL (-8%)"
+              : "KUNCI IMPAS · Zero Risk"
+            : "HOLD",
           badgeCls: "",
           borderCls: "",
           cardTintCls: "",
-          healthScore: isBearish || closeBreachedSl ? 8 : 75,
+          healthScore: isImmediateExit ? 8 : isDay1Warn ? 45 : 75,
           healthLabel: "",
           healthColorCls: "",
           healthReasons: [],
           headline: "",
           detail: "",
-          suggestedSl: r.slTickPrice,
+          suggestedSl: targetSl,
+          belowStStreak: isBearish ? Math.max(1, r.days_since_flip ?? 1) : 0,
           holdingBars: 1,
           daysToTimeStop: 19,
           currentPrice: r.close,
           netBreakevenPrice: ceilToIdxTick(pos.buy_price * 1.004),
           stLine: r.stLine ?? r.close,
           pnlRp: (r.close - pos.buy_price) * pos.lots * 100,
-          pnlPct: ((r.close - pos.buy_price) / pos.buy_price) * 100,
+          pnlPct,
           marketValue: r.close * pos.lots * 100,
-          slRiskFromCurrentPct: r.slRiskPct ?? 0,
-          lockedPnlRp:
-            r.slTickPrice !== null ? (r.slTickPrice - pos.buy_price) * pos.lots * 100 : null,
-          lockedPnlPct:
-            r.slTickPrice !== null ? ((r.slTickPrice - pos.buy_price) / pos.buy_price) * 100 : null,
-          isBreakevenOrBetter: (r.slTickPrice ?? 0) >= pos.buy_price,
+          slRiskFromCurrentPct: ((targetSl - r.close) / r.close) * 100,
+          lockedPnlRp: (targetSl - pos.buy_price) * pos.lots * 100,
+          lockedPnlPct: ((targetSl - pos.buy_price) / pos.buy_price) * 100,
+          isBreakevenOrBetter: targetSl >= pos.buy_price,
           currentSetupScore: r.score,
           addOnReady: false,
           addOnSuggestedLots: 0,
@@ -583,7 +648,12 @@ return {
 
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold tracking-tight md:text-2xl">Screener saham</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-xl font-bold tracking-tight md:text-2xl">Screener saham</h1>
+            <span className="rounded-full bg-indigo-50 px-2.5 py-0.5 text-xs font-bold text-indigo-800 ring-1 ring-indigo-200">
+              Skenario A + SL-7
+            </span>
+          </div>
           <p className="text-xs text-slate-500 md:text-sm">
             Data per {fmtDate(latestDate)} · Supertrend ATR {ST_PERIOD}, multiplier {ST_MULT.toFixed(1)} · {summary.live} emiten aktif
           </p>
@@ -597,11 +667,11 @@ return {
           <button
             onClick={() => setShowSizingBar((v) => !v)}
             className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-semibold text-slate-700 hover:bg-slate-50"
-            title="Atur modal, batas risiko per trade, dan batas jumlah posisi portofolio"
+            title="Atur modal, batas risiko per trade, dan batas jumlah slot portofolio"
           >
             <span>Modal: Rp {idCompact.format(prefs.capitalRp)}</span>
             <span className="text-slate-400">·</span>
-            <span>Risk {prefs.riskPerTradePct}%</span>
+            <span>{prefs.maxPositions} Slot</span>
             {ihsgBullish === false && (
               <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-bold text-rose-700">
                 Porsi 50%
@@ -629,21 +699,23 @@ return {
         </div>
       </div>
 
-      {/* Bar Pengaturan Modal & Risk Sizing */}
+      {/* Bar Pengaturan Modal & Slot Skenario A */}
       {showSizingBar && (
         <form onSubmit={handleSavePrefs} className="rounded-2xl border border-emerald-200 bg-white p-4 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <h2 className="text-sm font-bold text-slate-900">Pengaturan Position Sizing & Slot Portofolio</h2>
               <p className="text-xs text-slate-500">
-                Digunakan untuk menghitung Lot Ideal otomatis di Screener, Detail Saham, dan Morning Action Sheet.
+                Patokan Skenario A: Modal Rp 1 Miliar dibagi 25 slot (Rp 40 jt/slot saat Bullish, Rp 20 jt/slot saat Bearish) dengan Hard SL -8%.
               </p>
             </div>
-            {ihsgBullish === false && (
-              <span className="rounded-full bg-rose-100 px-3 py-1 text-xs font-bold text-rose-800">
-                IHSG Bearish Aktif: Lot otomatis dikali 50%
-              </span>
-            )}
+            <button
+              type="button"
+              onClick={handleResetScenarioA}
+              className="rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50"
+            >
+              Reset Patokan Skenario A
+            </button>
           </div>
 
           <div className="mt-3 grid gap-3 sm:grid-cols-4">
@@ -654,7 +726,7 @@ return {
                 inputMode="numeric"
                 value={capInput}
                 onChange={(e) => setCapInput(e.target.value)}
-                placeholder="100000000"
+                placeholder="1000000000"
                 className={inputCls}
               />
             </label>
@@ -665,18 +737,18 @@ return {
                 inputMode="decimal"
                 value={riskInput}
                 onChange={(e) => setRiskInput(e.target.value)}
-                placeholder="1.0"
+                placeholder="0.4"
                 className={inputCls}
               />
             </label>
             <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-600">Maks Slot Saham Aktif</span>
+              <span className="mb-1 block text-xs font-medium text-slate-600">Maks Slot Saham Aktif (1–50)</span>
               <input
                 required
                 inputMode="numeric"
                 value={slotInput}
                 onChange={(e) => setSlotInput(e.target.value)}
-                placeholder="5"
+                placeholder="25"
                 className={inputCls}
               />
             </label>
@@ -692,7 +764,7 @@ return {
         </form>
       )}
 
-      {/* Indikator Slot Portofolio */}
+      {/* Indikator Slot Portofolio & Alokasi Skenario A */}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs">
         <div className="flex flex-wrap items-center gap-2 text-slate-700">
           <span className="font-semibold text-slate-900">
@@ -707,11 +779,9 @@ return {
           </span>
         </div>
         <div className="text-slate-500">
-          Batas rugi per posisi:{" "}
-          <b className="tabular-nums text-slate-800">
-            Rp {idPrice.format(prefs.capitalRp * (prefs.riskPerTradePct / 100) * (ihsgBullish === false ? 0.5 : 1))}
-          </b>{" "}
-          ({ihsgBullish === false ? `${prefs.riskPerTradePct * 0.5}% defensif` : `${prefs.riskPerTradePct}% standar`})
+          Alokasi per slot:{" "}
+          <b className="tabular-nums text-slate-800">Rp {idPrice.format(slotBudgetRp)}</b>{" "}
+          ({ihsgBullish === false ? "IHSG Bearish 50%" : "IHSG Bullish 100%"} · Hard SL -8,0%)
         </div>
       </div>
 
@@ -846,32 +916,29 @@ return {
 
       <details className="group rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm">
         <summary className="cursor-pointer select-none font-medium text-slate-700">
-          Panduan eksekusi EOD & cara membaca kolom
+          Panduan eksekusi Skenario A + SL-7 & cara membaca kolom
         </summary>
         <dl className="mt-3 grid gap-x-8 gap-y-2.5 text-slate-600 md:grid-cols-2">
-          <Def t="Skor (0–100)">
-            Teruji backtest untuk swing 10–20 hari bursa. Fokus utama pada kuintil teratas (Skor ≥ 86) dan urutkan dari skor
-            tertinggi.
+          <Def t={`Skor (≥ ${SOP_BENCHMARK_CONFIG.minEntryScore})`}>
+            Fokus utama pada kuintil teratas (Skor ≥ {SOP_BENCHMARK_CONFIG.minEntryScore}) dan urutkan dari skor tertinggi.
           </Def>
-          <Def t="Order SL (Fraksi BEI)">
-            Otomatis dibulatkan 1 tick BEI di bawah garis Supertrend ATR {ST_PERIOD} (mult {ST_MULT}) agar siap langsung dipasang di
-            sekuritas. Hindari entry langsung jika risiko SL lebih dalam dari -8% (tunggu pullback).
+          <Def t="Hard SL (-8%) & Jarak ST">
+            Saat beli, pasang auto-SL keras di <b>-8,0% dari harga beli</b> (kolom Hard SL). Kolom <b>Jarak ST</b> memfilter agar
+            posisi garis Supertrend saat entry tidak terlalu jauh (&le; -8%).
           </Def>
-          <Def t="Lot Ideal (Position Sizing)">
-            Dihitung otomatis dari batas risiko modal Anda per trade dan jarak ke Order SL (otomatis dipotong 50% jika IHSG
-            Bearish).
+          <Def t="Lot Ideal (Alokasi 25 Slot)">
+            Modal dibagi rata ke <b>{prefs.maxPositions} slot</b> (Rp {idPrice.format(prefs.capitalRp / prefs.maxPositions)}/saham
+            saat IHSG Bullish; dipangkas 50% saat IHSG Bearish).
           </Def>
-          <Def t="Batas Beli (+1,5%)">
-            Harga limit order beli maksimal (sudah sesuai fraksi BEI). Jika harga pembukaan gap up di atas batas ini, lewati
-            kandidat tersebut.
+          <Def t="Batas Beli (+1,5% Anti-FOMO)">
+            Harga limit order beli maksimal (sesuai fraksi BEI). Jika pembukaan gap up di atas batas ini, batalkan order.
           </Def>
-          <Def t="Usia Tren (Bar)">
-            Tren paling optimal di rentang 5–40 bar sejak sinyal BUY. Sinyal 1–4 bar masih rawan false breakout, sedangkan di atas
-            40 bar sudah matang.
+          <Def t="Usia Tren (5–40 Bar)">
+            Kandidat beli wajib berada di usia tren <b>5–40 bar</b> sejak sinyal BUY. Sinyal 1–4 bar masih terlalu dini.
           </Def>
-          <Def t="RS % & Nilai/hari">
-            Peringkat kekuatan relatif 3 bulan (0–100%) dan rata-rata likuiditas 20 hari (minimal Rp {idNum.format(MIN_AVG_VALUE)}
-            /hari).
+          <Def t="Aturan Jual (SL-7)">
+            Geser SL ke <b>harga beli + 0,5%</b> saat profit ≥ +8%. Jual penuh hanya jika Close &lt; ST <b>2 hari berturut-turut</b>{" "}
+            (atau hari ke-1 jika rugi &le; -5%), atau stagnan ≥ 20 hari (&lt; +4%).
           </Def>
         </dl>
         <p className="mt-3 text-xs text-slate-500">Alat bantu analisis teknikal, bukan rekomendasi investasi.</p>
@@ -900,21 +967,21 @@ return {
               </th>
               <th
                 className="px-3 py-2.5 text-right font-medium"
-                title="Harga auto-SL (1 tick BEI di bawah garis Supertrend)"
+                title="Harga Hard Auto-SL awal (-8,0% dari close dibulatkan ke fraksi BEI)"
               >
-                Order SL
+                Hard SL (-8%)
               </th>
               <Th
                 k="slRiskPct"
-                label="Risiko SL"
+                label="Jarak ST"
                 right
                 sort={sort}
                 onSort={toggleSort}
-                tip="Persentase rugi dari close jika kena Order SL (maksimal ideal -8%)"
+                tip="Jarak close ke garis Supertrend (syarat entry maksimal -8%)"
               />
               <th
                 className="px-3 py-2.5 text-right font-medium"
-                title="Ukuran lot ideal sesuai batas risiko modal & rezim IHSG"
+                title="Ukuran lot ideal 1 slot Skenario A & rezim IHSG"
               >
                 Lot Ideal
               </th>
@@ -923,7 +990,7 @@ return {
                 label="Usia tren"
                 sort={sort}
                 onSort={toggleSort}
-                tip="Ideal pada 5–40 bar sejak sinyal BUY"
+                tip="Wajib 5–40 bar sejak sinyal BUY untuk entry baru"
               />
               <th className="px-3 py-2.5 text-right font-medium" title="Peringkat kekuatan relatif 60 bar (0–100)">
                 RS
@@ -941,16 +1008,17 @@ return {
           <tbody className="divide-y divide-slate-100">
             {view.map((r) => {
               const held = heldMap[r.ticker];
-              const wideSl = isWideSl(r);
-              const sizing =
-                r.trend === 1 && r.slTickPrice !== null && !wideSl
-                  ? computePositionSizing({
-                      entryPrice: r.close,
-                      stopLossPrice: r.slTickPrice,
-                      prefs,
-                      ihsgBullish,
-                    })
-                  : null;
+              const wideSt = isWideSt(r);
+              const idealAge = isIdealAge(r);
+              const canEnter = r.trend === 1 && !wideSt && idealAge;
+              const sizing = canEnter
+                ? computePositionSizing({
+                    entryPrice: r.close,
+                    stopLossPrice: r.hardSlPrice,
+                    prefs,
+                    ihsgBullish,
+                  })
+                : null;
 
               return (
                 <tr
@@ -969,7 +1037,7 @@ return {
                       {held &&
                         (held.isZeroRisk ? (
                           <span
-                            title={`Posisi ${held.lots} Lot sudah Zero Risk (SL >= harga beli), memenuhi syarat add-on`}
+                            title={`Posisi ${held.lots} Lot sudah Zero Risk (Breakeven Lock aktif), memenuhi syarat add-on`}
                             className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-bold text-emerald-800"
                           >
                             SIAP ADD-ON ({held.lots}L)
@@ -1002,11 +1070,11 @@ return {
                     {r.trend === 1 ? idPrice.format(r.maxBuyPrice) : "–"}
                   </td>
                   <td className="px-3 py-2.5 text-right font-semibold tabular-nums text-rose-600">
-                    {r.slTickPrice === null ? "–" : idPrice.format(r.slTickPrice)}
+                    {r.trend === 1 ? idPrice.format(r.hardSlPrice) : "–"}
                   </td>
                   <td
                     className={`px-3 py-2.5 text-right font-medium tabular-nums ${
-                      r.slRiskPct === null ? "text-slate-400" : wideSl ? "text-rose-600" : "text-emerald-700"
+                      r.slRiskPct === null ? "text-slate-400" : wideSt ? "text-rose-600" : "text-emerald-700"
                     }`}
                   >
                     {r.slRiskPct === null ? (
@@ -1014,19 +1082,26 @@ return {
                     ) : (
                       <div className="leading-tight">
                         <span>{r.slRiskPct.toFixed(1)}%</span>
-                        {wideSl && (
+                        {wideSt && (
                           <span className="block text-[10px] font-semibold text-rose-600">Tunggu pullback</span>
                         )}
                       </div>
                     )}
                   </td>
                   <td className="px-3 py-2.5 text-right tabular-nums">
-                    {wideSl ? (
+                    {wideSt ? (
                       <span
                         className="text-[11px] font-medium text-rose-500"
-                        title="Jarak SL > 8%, tunggu harga pullback mendekati garis Supertrend"
+                        title="Jarak ST > 8%, tunggu harga pullback mendekati garis Supertrend"
                       >
-                        SL &gt; 8%
+                        ST &gt; 8%
+                      </span>
+                    ) : !idealAge && r.trend === 1 ? (
+                      <span
+                        className="text-[11px] font-medium text-amber-600"
+                        title="Usia tren di luar rentang ideal 5–40 bar"
+                      >
+                        Usia ≠ 5–40
                       </span>
                     ) : sizing && sizing.lots > 0 ? (
                       <div className="leading-tight">
@@ -1057,16 +1132,17 @@ return {
       <div className="grid gap-2.5 sm:grid-cols-2 lg:hidden">
         {view.map((r) => {
           const held = heldMap[r.ticker];
-          const wideSl = isWideSl(r);
-          const sizing =
-            r.trend === 1 && r.slTickPrice !== null && !wideSl
-              ? computePositionSizing({
-                  entryPrice: r.close,
-                  stopLossPrice: r.slTickPrice,
-                  prefs,
-                  ihsgBullish,
-                })
-              : null;
+          const wideSt = isWideSt(r);
+          const idealAge = isIdealAge(r);
+          const canEnter = r.trend === 1 && !wideSt && idealAge;
+          const sizing = canEnter
+            ? computePositionSizing({
+                entryPrice: r.close,
+                stopLossPrice: r.hardSlPrice,
+                prefs,
+                ihsgBullish,
+              })
+            : null;
 
           return (
             <button
@@ -1094,9 +1170,9 @@ return {
                         DIPEGANG ({held.lots}L)
                       </span>
                     ))}
-                  {wideSl && (
+                  {wideSt && (
                     <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700">
-                      SL &gt; 8% · Tunggu pullback
+                      ST &gt; 8% · Tunggu pullback
                     </span>
                   )}
                   {r.rsPct !== null && (
@@ -1112,12 +1188,12 @@ return {
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
                   <SignalCell r={r} />
-                  {r.slTickPrice !== null && (
+                  {r.trend === 1 && (
                     <span>
-                      SL <b className="tabular-nums text-rose-600">{idPrice.format(r.slTickPrice)}</b>{" "}
+                      Hard SL <b className="tabular-nums text-rose-600">{idPrice.format(r.hardSlPrice)}</b>{" "}
                       {r.slRiskPct !== null && (
-                        <b className={`tabular-nums ${wideSl ? "text-rose-600" : "text-emerald-700"}`}>
-                          ({r.slRiskPct.toFixed(1)}%)
+                        <b className={`tabular-nums ${wideSt ? "text-rose-600" : "text-emerald-700"}`}>
+                          (ST {r.slRiskPct.toFixed(1)}%)
                         </b>
                       )}
                     </span>
@@ -1173,10 +1249,10 @@ return {
           <div onClick={(e) => e.stopPropagation()} className="w-full max-w-2xl space-y-4 rounded-2xl bg-white p-5 shadow-2xl">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h3 className="text-base font-bold text-slate-900">Morning Action Sheet · Rencana Besok Pagi</h3>
+                <h3 className="text-base font-bold text-slate-900">Morning Action Sheet · Patokan Skenario A + SL-7</h3>
                 <p className="text-xs text-slate-500">
-                  Gabungan prioritas Jual/Exit, Update Auto-SL, dan Antrean Beli Top Pick sesuai sisa slot ({freeSlots}/
-                  {prefs.maxPositions}).
+                  Gabungan prioritas Jual (Konfirmasi 2H), Update Hard SL / Breakeven Lock, dan Antrean Beli Top Pick ({freeSlots}/
+                  {prefs.maxPositions} slot tersedia).
                 </p>
               </div>
               <button
@@ -1243,7 +1319,7 @@ function FilterPanel({ f, setF, staleCount }: { f: Filters; setF: (p: Partial<Fi
             className={inputCls}
           />
         </Field>
-        <Field label="Risiko SL maks (%)" hint="Jarak dari close ke Order SL">
+        <Field label="Jarak ST maks (%)" hint="Jarak close ke garis Supertrend">
           <input
             value={f.maxSlPct}
             onChange={(e) => setF({ maxSlPct: e.target.value })}

@@ -19,21 +19,21 @@ function scoreVerdict(total: number) {
     return {
       badge: "Elite Top Pick · Top ~4%",
       cls: "bg-emerald-50 text-emerald-900 border-emerald-200",
-      desc: "Kandidat prioritas utama (audit final +3.05% / 10h, win rate 50.8%, Profit Factor 1.70). Siap dieksekusi jika risiko SL ≤ 8% dan tidak gap up > 1,5%.",
+      desc: "Kandidat prioritas utama Skenario A + SL-7 (audit final +3.05% / 10h, win rate 50.8%, Profit Factor 1.70). Siap dieksekusi jika jarak garis ST ≤ 8%, usia tren 5–40 bar, dan pembukaan tidak gap up > 1,5%.",
     };
   }
   if (total >= 71) {
     return {
       badge: "Kuat · Q5 (Top 20%)",
       cls: "bg-teal-50/70 text-teal-900 border-teal-200",
-      desc: "Masuk kuintil teratas bursa (audit +1.20% / 10h). Layak dipertimbangkan sebagai alternatif jika kandidat skor ≥ 86 sedang kosong.",
+      desc: "Masuk kuintil teratas bursa (audit +1.20% / 10h). Tidak masuk antrean otomatis Skenario A (wajib skor ≥ 86), namun tetap kuat secara teknikal.",
     };
   }
   if (total >= 57) {
     return {
       badge: "Cukup · Q4",
       cls: "bg-amber-50/70 text-amber-900 border-amber-200",
-      desc: "Struktur tren cukup baik namun momentum belum optimal. Sebaiknya tunggu konsolidasi lebih rapi atau pilih skor ≥ 71.",
+      desc: "Struktur tren cukup baik namun momentum belum optimal. Sebaiknya tunggu konsolidasi lebih rapi atau pilih skor ≥ 86.",
     };
   }
   return {

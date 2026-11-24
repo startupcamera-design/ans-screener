@@ -1,6 +1,39 @@
 import type { VBar } from "./metrics";
 import type { STPoint } from "./supertrend";
 
+/** Patokan Resmi Hasil Optimasi Backtest (Skenario A + SL-7) */
+export const SOP_BENCHMARK_CONFIG = {
+  strategyName: "SOP ANS Screener · Skenario A + SL-7 (2-Day Flip Confirm)",
+  periodLabel: "2025-06-13 s/d 2026-11-23 (352 hari bursa)",
+  initialCapitalRp: 1_000_000_000,
+  maxPositions: 25,
+  allocBullishRp: 40_000_000,
+  allocBearishRp: 20_000_000,
+  minEntryScore: 86,
+  maxInitialSlRiskPct: -8.0,
+  idealTrendAgeRange: [5, 40] as const,
+  antiFomoMaxGapPct: 1.5,
+  hardStopLossPct: -8.0,
+  breakevenLockTriggerPct: 8.0,
+  breakevenLockTargetPct: 0.5,
+  bearishFlipConfirmDays: 2,
+  bearishFlipImmediateLossPct: -5.0,
+  partialTpDailyJumpPct: 12.0,
+  partialTpFloatingPct: 15.0,
+  timeStopBars: 20,
+  timeStopMinProfitPct: 4.0,
+  backtestMetrics: {
+    cagrPct: 25.94,
+    totalReturnPct: 39.29,
+    maxDrawdownPct: -7.9,
+    winRatePct: 37.38,
+    profitFactor: 1.81,
+    expectancyPct: 3.0,
+    avgWinPct: 17.52,
+    avgLossPct: -5.66,
+  },
+} as const;
+
 export type ExitReason =
   | "AUTO_SL"
   | "SIGNAL_EXIT"
@@ -9,9 +42,9 @@ export type ExitReason =
   | "MANUAL";
 
 export const EXIT_REASON_LABELS: Record<ExitReason, string> = {
-  AUTO_SL: "Kena Auto-SL",
-  SIGNAL_EXIT: "Sinyal Exit Supertrend",
-  TIME_STOP: "Time-Stop (> 20 Hari Bursa)",
+  AUTO_SL: "Kena Auto-SL (-8% / BE Lock)",
+  SIGNAL_EXIT: "Konfirmasi Exit Supertrend (2 Hari)",
+  TIME_STOP: "Time-Stop (≥ 20 Hari Bursa)",
   TAKE_PROFIT: "Take Profit",
   MANUAL: "Jual Manual / Rotasi",
 };
@@ -41,6 +74,7 @@ export type PositionRow = {
 export type ActionCode =
   | "EXIT_STOP"
   | "CHECK_INTRADAY_SL"
+  | "BEARISH_FLIP_WARN"
   | "GAP_WARNING"
   | "RAISE_SL"
   | "SL_TOO_WIDE"
@@ -72,6 +106,7 @@ export type PositionAdvice = {
   headline: string;
   detail: string;
   suggestedSl: number | null;
+  belowStStreak: number; // jumlah hari bursa berturut-turut tutup di bawah garis ST
   holdingBars: number;
   daysToTimeStop: number; // sisa hari bursa menuju evaluasi 20 hari (0 jika sudah >= 20)
   currentPrice: number;
@@ -121,20 +156,31 @@ export function ceilToIdxTick(price: number): number {
   return Math.ceil(price / tick) * tick;
 }
 
+/** Hitung harga Hard Auto-SL awal (-8% dari harga beli sesuai SL-7) */
+export function calcHardSlPrice(buyPrice: number): number {
+  return floorToIdxTick(buyPrice * (1 + SOP_BENCHMARK_CONFIG.hardStopLossPct / 100), 0);
+}
+
+/** Hitung harga Breakeven Lock (+0.5% di atas harga beli setelah profit >= +8%) */
+export function calcBreakevenLockPrice(buyPrice: number): number {
+  return ceilToIdxTick(buyPrice * (1 + SOP_BENCHMARK_CONFIG.breakevenLockTargetPct / 100));
+}
+
 /** Pengaturan Modal, Manajemen Risiko & Batas Slot Portofolio (disimpan di localStorage) */
 export type TradingPrefs = {
-  capitalRp: number; // Total modal trading (default Rp 100.000.000)
-  riskPerTradePct: number; // Maksimal risiko rugi per posisi dalam % modal (default 1%)
-  maxPositions: number; // Maksimal jumlah saham aktif bersamaan (default 5)
+  capitalRp: number; // Total modal trading (default Rp 1.000.000.000 - Skenario A)
+  riskPerTradePct: number; // Maksimal risiko rugi per posisi dalam % modal (default 0.35% ~ 4% slot x 8% SL)
+  maxPositions: number; // Maksimal jumlah saham aktif bersamaan (default 25 - Skenario A)
 };
 
 export const DEFAULT_TRADING_PREFS: TradingPrefs = {
-  capitalRp: 100_000_000,
-  riskPerTradePct: 1.0,
-  maxPositions: 5,
+  capitalRp: SOP_BENCHMARK_CONFIG.initialCapitalRp, // Rp 1.000.000.000
+  riskPerTradePct: 0.4, // Mendukung alokasi penuh 1 slot (4% modal = Rp 40 jt) pada jarak SL -8%
+  maxPositions: SOP_BENCHMARK_CONFIG.maxPositions, // 25 slot aktif
 };
 
-const PREFS_STORAGE_KEY = "st_screener_trading_prefs_v1";
+// Versi v2 agar pengguna otomatis mendapatkan patokan Skenario A (1 Miliar / 25 Slot)
+const PREFS_STORAGE_KEY = "st_screener_trading_prefs_v2";
 
 export function loadTradingPrefs(): TradingPrefs {
   if (typeof window === "undefined") return DEFAULT_TRADING_PREFS;
@@ -156,7 +202,7 @@ export function loadTradingPrefs(): TradingPrefs {
       maxPositions:
         Number.isInteger(Number(parsed.maxPositions)) &&
         Number(parsed.maxPositions) >= 1 &&
-        Number(parsed.maxPositions) <= 20
+        Number(parsed.maxPositions) <= 50
           ? Number(parsed.maxPositions)
           : DEFAULT_TRADING_PREFS.maxPositions,
     };
@@ -182,13 +228,13 @@ export type PositionSizingResult = {
   actualRiskRp: number;
   riskPerShareRp: number;
   allocationPct: number;
-  regimeMultiplier: number; // 1.0 jika IHSG Bullish, 0.5 jika IHSG Bearish
+  regimeMultiplier: number; // 1.0 jika IHSG Bullish (Rp 40jt), 0.5 jika IHSG Bearish (Rp 20jt)
   cappedBySlotBudget: boolean;
 };
 
 /**
- * Menghitung ukuran lot ideal berbasis risiko modal, jarak Stop Loss BEI,
- * alokasi maksimal per slot portofolio, dan rezim IHSG (100% Bullish vs 50% Bearish).
+ * Menghitung ukuran lot ideal berbasis Skenario A (Modal dibagi 25 slot = 4% per saham,
+ * otomatis dipangkas 50% menjadi 2% per saham saat IHSG Bearish) & batas risiko SL maksimal -8%.
  */
 export function computePositionSizing(params: {
   entryPrice: number;
@@ -214,15 +260,14 @@ export function computePositionSizing(params: {
   }
 
   const effectiveCapital = prefs.capitalRp * regimeMultiplier;
-  const maxRiskAllowedRp = effectiveCapital * (prefs.riskPerTradePct / 100);
-  const riskPerShareRp = entryPrice - stopLossPrice;
-  const riskPerLotRp = riskPerShareRp * 100;
-
-  const lotsByRisk = Math.floor(maxRiskAllowedRp / riskPerLotRp);
-
   const maxAllocationPerSlotRp = effectiveCapital / Math.max(1, prefs.maxPositions);
   const costPerLotRp = entryPrice * 100;
   const lotsBySlot = Math.floor(maxAllocationPerSlotRp / costPerLotRp);
+
+  const maxRiskAllowedRp = effectiveCapital * (prefs.riskPerTradePct / 100);
+  const riskPerShareRp = entryPrice - stopLossPrice;
+  const riskPerLotRp = riskPerShareRp * 100;
+  const lotsByRisk = Math.floor(maxRiskAllowedRp / riskPerLotRp);
 
   const lots = Math.max(0, Math.min(lotsByRisk, lotsBySlot));
   const shares = lots * 100;
@@ -239,13 +284,14 @@ export function computePositionSizing(params: {
     riskPerShareRp,
     allocationPct,
     regimeMultiplier,
-    cappedBySlotBudget: lotsBySlot < lotsByRisk && lots > 0,
+    cappedBySlotBudget: lotsBySlot <= lotsByRisk && lots > 0,
   };
 }
 
-/** Hitung Skor Kesehatan Posisi (0–100) beserta rincian penyebabnya */
+/** Hitung Skor Kesehatan Posisi (0–100) sesuai aturan SL-7 */
 function computeHealthScore(params: {
   isBullish: boolean;
+  belowStStreak: number;
   closeBreachedSl: boolean;
   intradayTouchedSl: boolean;
   pnlPct: number;
@@ -266,6 +312,7 @@ function computeHealthScore(params: {
 } {
   const {
     isBullish,
+    belowStStreak,
     closeBreachedSl,
     intradayTouchedSl,
     pnlPct,
@@ -281,17 +328,28 @@ function computeHealthScore(params: {
 
   const reasons: HealthFactor[] = [];
 
-  if (!isBullish || closeBreachedSl) {
+  // Konfirmasi keluar penuh SL-7: Close tembus SL terpasang, atau 2 hari berturut-turut di bawah ST,
+  // atau hari ke-1 di bawah ST dengan floating loss <= -5%
+  const confirmedExit =
+    closeBreachedSl ||
+    belowStStreak >= SOP_BENCHMARK_CONFIG.bearishFlipConfirmDays ||
+    (!isBullish && pnlPct <= SOP_BENCHMARK_CONFIG.bearishFlipImmediateLossPct);
+
+  if (confirmedExit) {
     reasons.push({
-      label: !isBullish ? "Tren Berbalik Bearish" : "Close Tembus SL Terpasang",
+      label: closeBreachedSl
+        ? "Close Tembus Auto-SL Terpasang"
+        : belowStStreak >= 2
+        ? "Konfirmasi 2 Hari di Bawah Supertrend"
+        : `Bearish Flip & Rugi ≤ ${SOP_BENCHMARK_CONFIG.bearishFlipImmediateLossPct}%`,
       delta: -60,
-      detail: !isBullish
-        ? "Harga penutupan jatuh di bawah garis Supertrend (sinyal keluar aktif)."
-        : "Harga penutupan sudah melewati batas Stop Loss yang dipasang.",
+      detail: closeBreachedSl
+        ? "Harga penutupan sudah melewati batas Stop Loss yang dipasang."
+        : "Sinyal keluar terkonfirmasi sesuai aturan SL-7. Eksekusi jual saat pembukaan.",
     });
     return {
       score: 8,
-      label: "Kritis · Keluar",
+      label: "Kritis · Jual Besok",
       colorCls: "text-rose-700 bg-rose-100",
       cardTintCls: "bg-gradient-to-br from-rose-50/90 via-white to-white",
       reasons,
@@ -299,11 +357,21 @@ function computeHealthScore(params: {
   }
 
   let score = 68;
-  reasons.push({
-    label: "Tren Supertrend Bullish",
-    delta: 68,
-    detail: "Skor dasar selama harga bertahan di atas garis Supertrend.",
-  });
+  if (!isBullish && belowStStreak === 1) {
+    score -= 24;
+    reasons.push({
+      label: "Waspada Hari ke-1 di Bawah Supertrend",
+      delta: -24,
+      detail:
+        "Hari pertama tutup di bawah garis ST namun rugi masih > -5%. Tahan 1 hari untuk konfirmasi (aturan SL-7).",
+    });
+  } else {
+    reasons.push({
+      label: "Tren Supertrend Bullish",
+      delta: 68,
+      detail: "Skor dasar selama harga bertahan di atas garis Supertrend.",
+    });
+  }
 
   // 1. Pengaruh P/L saat ini (-20 s/d +22)
   const pnlDelta = Math.round(Math.max(-20, Math.min(22, pnlPct * 1.6)));
@@ -315,7 +383,7 @@ function computeHealthScore(params: {
       detail:
         pnlDelta > 0
           ? `Keuntungan berjalan +${pnlPct.toFixed(1)}% memberi ruang aman terhadap fluktuasi.`
-          : `Posisi sedang rugi ${pnlPct.toFixed(1)}% dari harga beli.`,
+          : `Posisi sedang rugi ${pnlPct.toFixed(1)}% dari harga beli (Hard SL di -8.0%).`,
     });
   } else {
     reasons.push({
@@ -325,13 +393,13 @@ function computeHealthScore(params: {
     });
   }
 
-  // 2. Bonus jika SL sudah di atas harga beli (zero risk / profit terkunci)
+  // 2. Bonus jika SL sudah di atas harga beli (Breakeven Lock aktif >= +8%)
   if (isBreakevenOrBetter) {
     score += 14;
     reasons.push({
-      label: "Trailing SL Mengunci Profit",
+      label: "Breakeven Lock Aktif (Zero Risk)",
       delta: 14,
-      detail: "Garis SL sudah naik di atas harga beli (risiko modal nol).",
+      detail: "Auto-SL sudah dikunci di atas harga beli (+0.5% atau lebih).",
     });
   }
 
@@ -367,17 +435,17 @@ function computeHealthScore(params: {
     reasons.push({
       label: `Tekanan Turun Harian (${dayChangePct.toFixed(1)}%)`,
       delta: -10,
-      detail: "Terjadi penurunan harian tajam yang menggerus jarak aman menuju garis SL.",
+      detail: "Terjadi penurunan harian tajam; pastikan Hard Auto-SL -8% aktif di sekuritas.",
     });
   }
 
-  // 5. Penalti waktu pegang jika stagnan (time decay)
+  // 5. Penalti waktu pegang jika stagnan (Time-Stop 20 bar < +4%)
   if (holdingBars >= 20 && pnlPct < 4) {
     score -= 28;
     reasons.push({
-      label: `Stagnan ≥ 20 Hari Bursa (${holdingBars}h)`,
+      label: `Time-Stop ≥ 20 Hari Bursa (${holdingBars}h)`,
       delta: -28,
-      detail: "Melewati batas horizon optimal audit (10–20 hari) tanpa kenaikan berarti.",
+      detail: "Melewati batas horizon optimal 20 hari bursa tanpa kenaikan minimal +4%.",
     });
   } else if (holdingBars >= 13 && pnlPct <= 1.5) {
     score -= 16;
@@ -391,7 +459,7 @@ function computeHealthScore(params: {
     reasons.push({
       label: `Tren Matang (${holdingBars} Hari Bursa)`,
       delta: -10,
-      detail: "Durasi pegang sudah melampaui 25 hari bursa; perlu pengawalan trailing SL ketat.",
+      detail: "Durasi pegang sudah melampaui 25 hari bursa; kawal konfirmasi penutupan Supertrend.",
     });
   } else {
     reasons.push({
@@ -405,7 +473,7 @@ function computeHealthScore(params: {
   if (intradayTouchedSl) {
     score -= 25;
     reasons.push({
-      label: "Low Intraday Sentuh SL",
+      label: "Low Intraday Sentuh Auto-SL",
       delta: -25,
       detail: "Harga terendah hari ini menyentuh batas SL terpasang (cek eksekusi di sekuritas).",
     });
@@ -420,21 +488,21 @@ function computeHealthScore(params: {
     });
   }
 
-  if (installedSlRiskFromBuyPct !== null && installedSlRiskFromBuyPct < -8.2) {
+  if (installedSlRiskFromBuyPct !== null && installedSlRiskFromBuyPct < -8.5) {
     score -= 12;
     reasons.push({
       label: `SL Terpasang Terlalu Lebar (${installedSlRiskFromBuyPct.toFixed(1)}%)`,
       delta: -12,
-      detail: "Batas risiko SL terpasang lebih dalam dari aturan maksimal -8% dari harga beli.",
+      detail: "Batas risiko SL terpasang lebih dalam dari aturan Hard SL -8.0%.",
     });
   }
 
-  if (distAtr < 0.4) {
-    score -= 10;
+  if (isBullish && distAtr < 0.4) {
+    score -= 6;
     reasons.push({
-      label: "Terlalu Mepet Garis SL",
-      delta: -10,
-      detail: `Jarak harga ke garis Supertrend sangat tipis (${distAtr.toFixed(2)} ATR), rawan tersapu noise.`,
+      label: "Dekat Garis Supertrend",
+      delta: -6,
+      detail: `Jarak ke garis ST tipis (${distAtr.toFixed(2)} ATR), namun tetap terlindungi konfirmasi 2 hari SL-7.`,
     });
   }
 
@@ -484,8 +552,8 @@ export type EvaluatePositionContext = {
 };
 
 /**
- * Mengevaluasi posisi terbuka berdasarkan data bar harian & Supertrend terbaru
- * untuk menghasilkan rekomendasi tindakan spesifik besok pagi + skor kesehatan.
+ * Mengevaluasi posisi terbuka berdasarkan aturan SL-7 (Hard SL -8% saat entry,
+ * Breakeven Lock +0.5% saat profit >= +8%, dan 2-Day Bearish Flip Confirmation).
  */
 export function evaluatePosition(
   pos: PositionRow,
@@ -508,7 +576,7 @@ export function evaluatePosition(
     prevBar && prevBar.close > 0 ? ((currentPrice - prevBar.close) / prevBar.close) * 100 : 0;
 
   const holdingBars = Math.max(1, bars.filter((b) => b.date >= pos.buy_date).length);
-  const daysToTimeStop = Math.max(0, 20 - holdingBars);
+  const daysToTimeStop = Math.max(0, SOP_BENCHMARK_CONFIG.timeStopBars - holdingBars);
 
   const shares = pos.lots * 100;
   const costBasis = pos.buy_price * shares;
@@ -517,17 +585,43 @@ export function evaluatePosition(
   const pnlPct = costBasis > 0 ? ((currentPrice - pos.buy_price) / pos.buy_price) * 100 : 0;
   const netBreakevenPrice = ceilToIdxTick(pos.buy_price * 1.004); // kompensasi fee beli + jual ~0.40%
 
-  const isBullish = lastSt.trend === 1;
-  const stLine = isBullish ? lastSt.up : lastSt.dn;
-  const suggestedSl = isBullish ? floorToIdxTick(lastSt.up, 1) : null;
+  // Hitung jumlah hari berturut-turut Close < Garis Supertrend (sejak tanggal beli)
+  const stOffset = bars.length - st.length;
+  let belowStStreak = 0;
+  for (let i = bars.length - 1; i >= 0; i--) {
+    if (bars[i].date < pos.buy_date) break;
+    const stIdx = i - stOffset;
+    if (stIdx < 0 || stIdx >= st.length) break;
+    const pt = st[stIdx];
+    const barBearish = pt.trend === -1 || bars[i].close < pt.up;
+    if (barBearish) {
+      belowStStreak++;
+    } else {
+      break;
+    }
+  }
+
+  const isBullish = lastSt.trend === 1 && currentPrice >= lastSt.up;
+  const stLine = lastSt.trend === 1 ? lastSt.up : lastSt.dn;
+
+  // Aturan SL-7:
+  // - Default: Hard Auto-SL di -8.0% dari harga beli (tidak perlu digeser tiap malam)
+  // - Jika floating profit >= +8.0%: aktifkan Breakeven Lock di harga beli + 0.5%
+  const hardSlPrice = calcHardSlPrice(pos.buy_price);
+  const breakevenLockPrice = calcBreakevenLockPrice(pos.buy_price);
+  const targetSlByRule =
+    pnlPct >= SOP_BENCHMARK_CONFIG.breakevenLockTriggerPct
+      ? Math.max(hardSlPrice, breakevenLockPrice)
+      : hardSlPrice;
+
+  const suggestedSl =
+    pos.sl_installed !== null ? Math.max(pos.sl_installed, targetSlByRule) : targetSlByRule;
+
   const slRiskFromCurrentPct =
     suggestedSl && currentPrice > 0 ? ((suggestedSl - currentPrice) / currentPrice) * 100 : 0;
 
-  // Hitung P/L terkunci berdasarkan SL tertinggi yang relevan (terpasang vs disarankan)
   const referenceSl =
-    pos.sl_installed !== null && suggestedSl !== null
-      ? Math.max(pos.sl_installed, suggestedSl)
-      : pos.sl_installed ?? suggestedSl;
+    pos.sl_installed !== null ? Math.max(pos.sl_installed, suggestedSl) : suggestedSl;
   const lockedPnlRp =
     referenceSl !== null && shares > 0 ? (referenceSl - pos.buy_price) * shares : null;
   const lockedPnlPct =
@@ -573,7 +667,7 @@ export function evaluatePosition(
     lastBar.low <= pos.sl_installed &&
     currentPrice > pos.sl_installed;
 
-  // Hitung kesiapan Add-On (Pyramiding) — syarat diperketat dengan skor setup terbaru >= 80
+  // Hitung kesiapan Add-On (Pyramiding)
   const scoreAllowsAddOn = currentSetupScore === null || currentSetupScore >= 80;
   const addOnReady =
     isBullish &&
@@ -583,7 +677,7 @@ export function evaluatePosition(
     sameTickerCount === 1 &&
     ihsgBullish !== false &&
     isBreakevenOrBetter &&
-    pnlPct >= 5 &&
+    pnlPct >= 8 &&
     pnlPct <= 14 &&
     holdingBars >= 3 &&
     holdingBars <= 12 &&
@@ -604,6 +698,7 @@ export function evaluatePosition(
 
   const health = computeHealthScore({
     isBullish,
+    belowStStreak,
     closeBreachedSl,
     intradayTouchedSl,
     pnlPct,
@@ -630,6 +725,7 @@ export function evaluatePosition(
     healthColorCls: health.colorCls,
     cardTintCls: health.cardTintCls,
     healthReasons: health.reasons,
+    belowStStreak,
     holdingBars,
     daysToTimeStop,
     currentPrice,
@@ -647,18 +743,31 @@ export function evaluatePosition(
     addOnSuggestedLots,
   };
 
-  // 1. PRIORITAS TERTINGGI: Tren berbalik Bearish atau Close tembus SL terpasang
-  if (!isBullish || closeBreachedSl) {
+  // 1. PRIORITAS TERTINGGI: Close tembus SL terpasang, 2 hari berturut-turut di bawah ST,
+  //    atau hari ke-1 di bawah ST dengan floating loss <= -5.0% (Aturan SL-7)
+  const isConfirmedBearishExit =
+    belowStStreak >= SOP_BENCHMARK_CONFIG.bearishFlipConfirmDays ||
+    (!isBullish && pnlPct <= SOP_BENCHMARK_CONFIG.bearishFlipImmediateLossPct);
+
+  if (closeBreachedSl || isConfirmedBearishExit) {
+    const reasonText = closeBreachedSl
+      ? `Harga penutupan (${fmtRp(currentPrice)}) sudah menyentuh/menembus batas Auto-SL terpasang (${fmtRp(pos.sl_installed!)}).`
+      : belowStStreak >= 2
+      ? `Harga ditutup di bawah garis Supertrend (${fmtRp(stLine)}) selama ${belowStStreak} hari bursa berturut-turut (konfirmasi 2 hari SL-7 tercapai).`
+      : `Harga ditutup di bawah garis Supertrend (${fmtRp(stLine)}) dan posisi sedang rugi ${pnlPct.toFixed(1)}% (melewati batas -5.0% untuk pangkas rugi cepat).`;
+
     return {
       ...base,
       code: "EXIT_STOP",
-      badge: "JUAL BESOK · Sinyal Keluar",
+      badge: closeBreachedSl
+        ? "JUAL BESOK · Kena SL"
+        : belowStStreak >= 2
+        ? "JUAL BESOK · Konfirmasi 2H"
+        : "JUAL BESOK · Cut Loss",
       badgeCls: "bg-rose-600 text-white",
       borderCls: "border-rose-400",
-      headline: "Pasang order jual saat market buka (atau pastikan auto-SL tereksekusi).",
-      detail: !isBullish
-        ? `Tren Supertrend telah berbalik BEARISH (harga tutup ${fmtRp(currentPrice)} di bawah garis ${fmtRp(stLine)}). Jangan menahan posisi melawan tren.`
-        : `Harga penutupan (${fmtRp(currentPrice)}) sudah menyentuh/menembus batas SL terpasang Anda (${fmtRp(pos.sl_installed!)}).`,
+      headline: "Pasang order jual penuh saat market buka besok pagi (Prioritas 1).",
+      detail: reasonText,
       suggestedSl: null,
     };
   }
@@ -672,42 +781,61 @@ export function evaluatePosition(
       badgeCls: "bg-rose-500 text-white",
       borderCls: "border-rose-300",
       headline: `Low hari ini (${fmtRp(lastBar.low)}) menyentuh SL terpasang (${fmtRp(pos.sl_installed!)}), meski tutup di ${fmtRp(currentPrice)}.`,
-      detail: `Periksa status auto-order di aplikasi sekuritas Anda. Jika barang sudah terjual otomatis, klik "Catat Jual". Jika belum terjual dan masih dipegang, pastikan SL aktif di ${fmtRp(suggestedSl ?? pos.sl_installed!)}.`,
+      detail: `Periksa status auto-order di aplikasi sekuritas Anda. Jika barang sudah terjual otomatis, klik "Catat Jual". Jika belum terjual, pastikan SL aktif di ${fmtRp(suggestedSl)}.`,
       suggestedSl,
     };
   }
 
-  // 3. PRIORITAS KETIGA: Garis SL Supertrend naik di atas SL terpasang (atau SL belum dipasang)
-  const needsSlUpdate =
-    suggestedSl !== null &&
-    (pos.sl_installed === null || suggestedSl > pos.sl_installed);
+  // 3. PRIORITAS KETIGA (KHAS SL-7): Hari ke-1 tutup di bawah garis ST, tapi P/L masih > -5.0%
+  if (!isBullish && belowStStreak === 1) {
+    return {
+      ...base,
+      code: "BEARISH_FLIP_WARN",
+      badge: "WASPADA HARI KE-1 · Tahan",
+      badgeCls: "bg-amber-600 text-white",
+      borderCls: "border-amber-400",
+      headline: `Tutup tipis di bawah garis ST (${fmtRp(currentPrice)} < ${fmtRp(stLine)}), tetapi masih aman dari batas -5%. Tahan 1 hari konfirmasi.`,
+      detail: `Sesuai aturan SL-7 (2-Day Flip Confirm), jangan panik menjual pada hari pertama penembusan tipis. Jika besok tutup kembali di atas ${fmtRp(stLine)}, lanjut HOLD; jika kembali tutup di bawah ST (hari ke-2), jual penuh lusa pagi. Pastikan Auto-SL tetap aktif di ${fmtRp(pos.sl_installed ?? suggestedSl)}.`,
+      suggestedSl,
+    };
+  }
 
-  if (needsSlUpdate && suggestedSl !== null) {
+  // 4. PRIORITAS KEEMPAT: Pasang Hard SL awal (-8%) atau aktifkan Breakeven Lock (+0.5% saat profit >= +8%)
+  const needsSlUpdate =
+    pos.sl_installed === null ||
+    (pnlPct >= SOP_BENCHMARK_CONFIG.breakevenLockTriggerPct &&
+      pos.sl_installed < breakevenLockPrice);
+
+  if (needsSlUpdate) {
     const isInitial = pos.sl_installed === null;
+    const isLockingBreakeven = pnlPct >= SOP_BENCHMARK_CONFIG.breakevenLockTriggerPct;
     const lockedProfitPct = ((suggestedSl - pos.buy_price) / pos.buy_price) * 100;
 
     return {
       ...base,
       code: "RAISE_SL",
-      badge: isInitial ? "PASANG SL AWAL" : "NAIKKAN TRAILING SL",
+      badge: isInitial
+        ? "PASANG HARD SL (-8%)"
+        : isLockingBreakeven
+        ? "KUNCI IMPAS · Zero Risk"
+        : "SESUAIKAN AUTO-SL",
       badgeCls: "bg-emerald-600 text-white",
       borderCls: "border-emerald-300",
       headline: isInitial
-        ? `Pasang auto-order SL di ${fmtRp(suggestedSl)} sebelum bursa buka.`
-        : `Geser naik auto-order SL dari ${fmtRp(pos.sl_installed!)} ke ${fmtRp(suggestedSl)}.`,
-      detail: isBreakevenOrBetter
-        ? `Garis Supertrend naik ke ${fmtRp(stLine)}. Dengan SL baru di ${fmtRp(suggestedSl)} (1 tick di bawah garis), posisi ini sudah mengunci profit minimal +${lockedProfitPct.toFixed(1)}% (zero risk).`
-        : `Garis Supertrend naik ke ${fmtRp(stLine)}. Memasang SL di ${fmtRp(suggestedSl)} (1 tick di bawah garis) memangkas risiko rugi menjadi ${lockedProfitPct.toFixed(1)}% dari harga beli.`,
+        ? `Pasang Hard Auto-SL awal di ${fmtRp(suggestedSl)} (-8.0% dari harga beli).`
+        : `Profit sudah +${pnlPct.toFixed(1)}% (≥ +8%). Geser Auto-SL ke ${fmtRp(suggestedSl)} untuk kunci modal!`,
+      detail: isInitial
+        ? `Dengan aturan SL-7, Anda cukup memasang Hard Auto-SL sekali di ${fmtRp(suggestedSl)} dan membiarkan tren berjalan sampai muncul konfirmasi 2 hari Bearish Flip.`
+        : `Floating profit telah melewati ambang +8.0%. Menaikkan Auto-SL dari ${fmtRp(pos.sl_installed!)} ke ${fmtRp(suggestedSl)} (${lockedProfitPct >= 0 ? `+${lockedProfitPct.toFixed(1)}%` : `${lockedProfitPct.toFixed(1)}%`}) menghilangkan risiko kerugian pokok modal.`,
       suggestedSl,
     };
   }
 
-  // 4. PRIORITAS KEEMPAT: SL terpasang terlalu lebar (> -8.2% dari harga beli) sementara garis ST lebih dekat
+  // 5. PRIORITAS KELIMA: SL terpasang terlalu lebar (> -8.5% dari harga beli)
   if (
     installedSlRiskFromBuyPct !== null &&
-    installedSlRiskFromBuyPct < -8.2 &&
-    suggestedSl !== null &&
-    suggestedSl > pos.sl_installed!
+    installedSlRiskFromBuyPct < -8.5 &&
+    hardSlPrice > pos.sl_installed!
   ) {
     return {
       ...base,
@@ -715,16 +843,16 @@ export function evaluatePosition(
       badge: "PERKETAT SL · Risiko > 8%",
       badgeCls: "bg-rose-600 text-white",
       borderCls: "border-rose-300",
-      headline: `SL terpasang (${fmtRp(pos.sl_installed!)}) berisiko ${installedSlRiskFromBuyPct.toFixed(1)}% dari harga beli. Naikkan ke ${fmtRp(suggestedSl)}.`,
-      detail: `Aturan manajemen risiko membatasi kerugian maksimal di kisaran -8%. Geser SL ke ${fmtRp(suggestedSl)} agar ukuran kerugian tetap terkendali sesuai standar sistem.`,
-      suggestedSl,
+      headline: `SL terpasang (${fmtRp(pos.sl_installed!)}) berisiko ${installedSlRiskFromBuyPct.toFixed(1)}% dari harga beli. Naikkan ke ${fmtRp(hardSlPrice)}.`,
+      detail: `Aturan Skenario A + SL-7 membatasi Hard Auto-SL maksimal di -8.0% (${fmtRp(hardSlPrice)}) dari harga beli agar kerugian tetap terkendali.`,
+      suggestedSl: hardSlPrice,
     };
   }
 
-  // 5. PRIORITAS KELIMA: Lonjakan parabolik / ARA dalam 1 hari atau melesat > 4.2 ATR
-  if (dayChangePct >= 12 || (distAtr >= 4.2 && pnlPct >= 15)) {
+  // 6. PRIORITAS KEENAM: Lonjakan parabolik (+12% sehari) atau melesat > 4.2 ATR -> TP Parsial 50%
+  if (dayChangePct >= SOP_BENCHMARK_CONFIG.partialTpDailyJumpPct || (distAtr >= 4.2 && pnlPct >= 15)) {
     const spikeSl =
-      todayLowSl > (suggestedSl ?? 0) && todayLowSl < currentPrice ? todayLowSl : tightProfitSl;
+      todayLowSl > (pos.sl_installed ?? 0) && todayLowSl < currentPrice ? todayLowSl : tightProfitSl;
     const useSpikeSl = spikeSl > (pos.sl_installed ?? 0) && spikeSl < currentPrice;
     const activeSl = useSpikeSl ? spikeSl : suggestedSl;
     const lockedPct = activeSl ? ((activeSl - pos.buy_price) / pos.buy_price) * 100 : 0;
@@ -732,54 +860,57 @@ export function evaluatePosition(
     return {
       ...base,
       code: "PARABOLIC_SPIKE",
-      badge: "LONJAKAN EKSTREM · Amankan Profit",
+      badge: "TP PARSIAL 50% · Lonjakan Ekstrem",
       badgeCls: "bg-emerald-700 text-white",
       borderCls: "border-emerald-400",
-      headline: `Harga melesat +${dayChangePct.toFixed(1)}% hari ini (total +${pnlPct.toFixed(1)}%, jarak ${distAtr.toFixed(1)} ATR). Kunci profit ketat!`,
+      headline: `Harga melesat +${dayChangePct.toFixed(1)}% hari ini (total +${pnlPct.toFixed(1)}%). Jual 50% lot & kunci sisa lot!`,
       detail: useSpikeSl
-        ? `Kenaikan vertikal rawan profit-taking mendadak besok pagi. Pertimbangkan TP sebagian (50% lot) atau naikkan SL ketat ke ${fmtRp(spikeSl)} (mengunci +${lockedPct.toFixed(1)}%).`
-        : `Kenaikan sudah jauh melampaui rata-rata volatilitas harian (${distAtr.toFixed(1)} ATR). Pertimbangkan merealisasikan sebagian keuntungan saat pembukaan menguat.`,
+        ? `Sesuai SOP TP Bertahap, amankan 50% lot sekarang dan geser Auto-SL sisa 50% lot ke Low 3 hari (${fmtRp(spikeSl)}, mengunci +${lockedPct.toFixed(1)}%).`
+        : `Kenaikan sudah melampaui +12% dalam sehari. Realisasikan 50% lot untuk mengunci keuntungan dan biarkan sisanya mengikuti tren.`,
       suggestedSl: activeSl,
     };
   }
 
-  // 6. PRIORITAS KEENAM: Profit lebar (>= +15% atau > 3.5 ATR) -> Tawarkan kunci profit ketat
-  if ((distAtr >= 3.5 && pnlPct >= 12) || pnlPct >= 18) {
-    const useTight = tightProfitSl > (suggestedSl ?? 0) && tightProfitSl < currentPrice;
+  // 7. PRIORITAS KETUJUH: Profit lebar (>= +15%) -> Opsi TP Parsial 50% + Geser SL ke Low 3 hari
+  if (pnlPct >= SOP_BENCHMARK_CONFIG.partialTpFloatingPct) {
+    const useTight = tightProfitSl > (pos.sl_installed ?? 0) && tightProfitSl < currentPrice;
     const activeSl = useTight ? tightProfitSl : suggestedSl;
     const lockedPct = activeSl ? ((activeSl - pos.buy_price) / pos.buy_price) * 100 : 0;
 
     return {
       ...base,
       code: "EXTENDED_PROFIT",
-      badge: "PROFIT LEBAR · Kunci Keuntungan",
+      badge: "PROFIT ≥ +15% · TP Bertahap",
       badgeCls: "bg-emerald-700 text-white",
       borderCls: "border-emerald-300",
-      headline: `Profit sudah +${pnlPct.toFixed(1)}% (${distAtr.toFixed(1)} ATR di atas garis ST). ${
+      headline: `Profit sudah +${pnlPct.toFixed(1)}%. ${
         useTight
-          ? `Opsi SL ketat di Low 3 hari: ${fmtRp(tightProfitSl)} (kunci +${lockedPct.toFixed(1)}%).`
-          : "Pertimbangkan TP sebagian atau kawal trailing SL."
+          ? `TP 50% lot & geser SL sisa lot ke Low 3 hari: ${fmtRp(tightProfitSl)} (kunci +${lockedPct.toFixed(1)}%).`
+          : "Pertimbangkan TP parsial 50% lot atau kawal dengan konfirmasi 2 hari ST."
       }`,
-      detail: `Jarak ke garis Supertrend standar (${fmtRp(suggestedSl ?? stLine)}) cukup jauh (${slRiskFromCurrentPct.toFixed(1)}%). Anda bisa menggeser SL ke bawah Low 3 bar terakhir (${fmtRp(tightProfitSl)}) atau melepas sebagian lot untuk mengamankan keuntungan.`,
+      detail: `Target TP parsial SOP (+15%) telah tercapai. Anda dapat melepas 50% lot dan menggeser SL sisa lot ke bawah Low 3 bar terakhir (${fmtRp(tightProfitSl)}) sambil membiarkan sisa posisi berlari.`,
       suggestedSl: activeSl,
     };
   }
 
-  // 7. PRIORITAS KETUJUH: Time-Stop (Sudah >= 20 hari bursa tapi stagnan < +4%)
-  if (holdingBars >= 20 && pnlPct < 4) {
+  // 8. PRIORITAS KEDELAPAN: Time-Stop (Sudah >= 20 hari bursa tapi stagnan < +4%)
+  if (
+    holdingBars >= SOP_BENCHMARK_CONFIG.timeStopBars &&
+    pnlPct < SOP_BENCHMARK_CONFIG.timeStopMinProfitPct
+  ) {
     return {
       ...base,
       code: "TIME_STOP",
-      badge: "EVALUASI TIME-STOP",
+      badge: "JUAL BESOK · Time-Stop 20H",
       badgeCls: "bg-amber-600 text-white",
       borderCls: "border-amber-300",
-      headline: `Sudah dipegang ${holdingBars} hari bursa dengan return ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%. Pertimbangkan jual & rotasi modal.`,
-      detail: `Horizon optimal strategi ini adalah 10–20 hari bursa. Jika setelah 20 hari harga belum bergerak signifikan, modal lebih produktif dipindahkan ke kandidat Top Pick (Skor ≥ 86) yang baru.`,
+      headline: `Sudah dipegang ${holdingBars} hari bursa dengan return ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}% (< +4%). Jual & rotasi modal.`,
+      detail: `Sesuai aturan Time-Stop SOP, saham yang belum naik minimal +4% setelah 20 hari bursa sebaiknya dijual saat market buka untuk memutar kas ke kandidat Top Pick (Skor ≥ 86) yang baru.`,
       suggestedSl,
     };
   }
 
-  // 8. PRIORITAS KEDELAPAN: Tekanan koreksi tajam mendekati SL (< 1.8% jarak ke SL)
+  // 9. PRIORITAS KESEMBILAN: Tekanan koreksi tajam mendekati SL (< 1.8% jarak ke SL)
   const distToActiveSlPct =
     pos.sl_installed && currentPrice > 0
       ? ((currentPrice - pos.sl_installed) / currentPrice) * 100
@@ -789,16 +920,16 @@ export function evaluatePosition(
     return {
       ...base,
       code: "GAP_WARNING",
-      badge: "SIAGA · Mepet Batas SL",
+      badge: "SIAGA · Mepet Hard SL",
       badgeCls: "bg-amber-600 text-white",
       borderCls: "border-amber-300",
-      headline: `Turun ${dayChangePct.toFixed(1)}% hari ini; harga hanya terpaut ${distToActiveSlPct.toFixed(1)}% di atas SL (${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}).`,
-      detail: `Jika besok pagi dibuka gap down di bawah batas SL, pastikan auto-order SL Anda aktif agar tidak terkena slippage lebih dalam.`,
+      headline: `Turun ${dayChangePct.toFixed(1)}% hari ini; harga hanya terpaut ${distToActiveSlPct.toFixed(1)}% di atas Auto-SL (${fmtRp(pos.sl_installed ?? suggestedSl)}).`,
+      detail: `Pastikan auto-order SL di sekuritas aktif agar jika besok pagi dibuka melemah di bawah batas SL, kerugian langsung terpotong otomatis.`,
       suggestedSl,
     };
   }
 
-  // 9. PRIORITAS KESEMBILAN: Peringatan dini stagnan (hari ke-13 s/d 19), volume distribusi, atau skor turun drastis
+  // 10. PRIORITAS KESEPULUH: Peringatan dini stagnan (hari ke-13 s/d 19), volume distribusi, atau skor turun drastis
   const scoreDegraded = currentSetupScore !== null && currentSetupScore < 57;
   if (heavyDistribution || (holdingBars >= 13 && pnlPct <= 1.5) || scoreDegraded) {
     return {
@@ -812,20 +943,20 @@ export function evaluatePosition(
       badgeCls: "bg-amber-500 text-white",
       borderCls: "border-amber-300",
       headline: heavyDistribution
-        ? `Muncul candle merah dengan lonjakan volume (>2x rata-rata). Pastikan auto-SL aktif di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`
+        ? `Muncul candle merah bervolume besar (>2x rata-rata). Pastikan Hard SL aktif di ${fmtRp(pos.sl_installed ?? suggestedSl)}.`
         : scoreDegraded
-        ? `Skor struktur tren saham ini turun ke ${currentSetupScore}/100 (terdeteksi sideways). Kawal ketat SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`
-        : `Sudah ${holdingBars} hari bursa (sisa ${daysToTimeStop} hari evaluasi) dan harga masih jalan di tempat (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%).`,
+        ? `Skor struktur tren turun ke ${currentSetupScore}/100 (terdeteksi sideways). Jangan tambah lot baru.`
+        : `Sudah ${holdingBars} hari bursa (sisa ${daysToTimeStop} hari evaluasi Time-Stop) dan harga masih jalan di tempat (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%).`,
       detail: heavyDistribution
-        ? `Terjadi tekanan jual besar hari ini. Jangan menambah posisi; biarkan garis SL Supertrend menjaga batas kerugian Anda.`
+        ? `Terjadi tekanan jual besar hari ini. Jangan menambah posisi; biarkan Hard Auto-SL (-8%) menjaga batas risiko Anda.`
         : scoreDegraded
-        ? `Meskipun belum menyentuh garis Supertrend, indikator kualitas tren mulai melemah. Jangan menambah lot baru pada posisi ini.`
-        : `Mendekati batas evaluasi 20 hari bursa. Jika belum mampu menembus naik, bersiaplah melakukan rotasi modal.`,
+        ? `Indikator momentum mulai melemah. Pertahankan posisi selama belum kena SL atau konfirmasi 2 hari di bawah Supertrend.`
+        : `Mendekati batas evaluasi 20 hari bursa. Jika belum mampu menembus +4%, bersiaplah melakukan rotasi modal.`,
       suggestedSl,
     };
   }
 
-  // 10. PRIORITAS KESEPULUH: Tren matang (> 25 hari bursa) dalam kondisi profit
+  // 11. PRIORITAS KESEBELAS: Tren matang (> 25 hari bursa) dalam kondisi profit
   if (holdingBars > 25 && pnlPct >= 4) {
     const useTight = tightProfitSl > (pos.sl_installed ?? 0) && tightProfitSl < currentPrice;
     return {
@@ -834,15 +965,15 @@ export function evaluatePosition(
       badge: `TREN MATANG · H-${holdingBars}`,
       badgeCls: "bg-teal-700 text-white",
       borderCls: "border-teal-300",
-      headline: `Posisi sudah berjalan ${holdingBars} hari bursa (+${pnlPct.toFixed(1)}%). Kawal ketat sisa tren dengan trailing SL.`,
+      headline: `Posisi sudah berjalan ${holdingBars} hari bursa (+${pnlPct.toFixed(1)}%). Biarkan pemenang berlari dengan pengawalan SL-7.`,
       detail: useTight
-        ? `Durasi pegang sudah melampaui siklus normal 20 hari. Anda bisa menggeser SL ke Low 3 bar (${fmtRp(tightProfitSl)}) agar kenaikan lebih dari 3 minggu tidak berbalik impas.`
-        : `Durasi pegang sudah di atas 25 hari bursa. Pertahankan auto-SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)} dan hindari menambah lot baru pada tren yang sudah tua.`,
+        ? `Durasi pegang sudah melampaui 25 hari. Anda bisa menggeser SL ke Low 3 bar (${fmtRp(tightProfitSl)}) atau tetap membiarkannya mengikuti konfirmasi 2 hari Supertrend.`
+        : `Pertahankan Auto-SL di ${fmtRp(pos.sl_installed ?? suggestedSl)} dan biarkan tren berjalan hingga muncul 2 hari penutupan di bawah Supertrend.`,
       suggestedSl: useTight ? tightProfitSl : suggestedSl,
     };
   }
 
-  // 11. PRIORITAS KESEBELAS: Kandidat Pyramiding / Add-on
+  // 12. PRIORITAS KEDUABELAS: Kandidat Pyramiding / Add-on
   if (addOnReady && addOnSuggestedLots > 0) {
     return {
       ...base,
@@ -850,13 +981,13 @@ export function evaluatePosition(
       badge: "SIAP ADD-ON · Zero Risk",
       badgeCls: "bg-sky-700 text-white",
       borderCls: "border-sky-300",
-      headline: `Modal awal sudah aman (SL di atas harga impas) & tren menguat (+${pnlPct.toFixed(1)}%, jarak ${distAtr.toFixed(1)} ATR).`,
-      detail: `Jika slot portofolio masih tersedia, posisi ini memenuhi syarat untuk pyramiding (+${addOnSuggestedLots} lot) dengan batas SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
+      headline: `Modal awal sudah aman (Breakeven Lock aktif) & tren menguat (+${pnlPct.toFixed(1)}%).`,
+      detail: `Jika slot portofolio (< 25) masih tersedia, posisi ini memenuhi syarat untuk pyramiding (+${addOnSuggestedLots} lot) dengan batas SL di ${fmtRp(pos.sl_installed ?? suggestedSl)}.`,
       suggestedSl,
     };
   }
 
-  // 12. PRIORITAS KEDUABELAS: Fase inkubasi awal (Baru pegang 1–3 hari bursa)
+  // 13. PRIORITAS KETIGABELAS: Fase inkubasi awal (Baru pegang 1–3 hari bursa)
   if (holdingBars <= 3) {
     return {
       ...base,
@@ -864,21 +995,21 @@ export function evaluatePosition(
       badge: `POSISI BARU · H-${holdingBars}`,
       badgeCls: "bg-slate-800 text-white",
       borderCls: "border-emerald-200",
-      headline: `Fase awal swing (hari ke-${holdingBars}). Biarkan harga bernapas dengan SL di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
-      detail: `Pada 1–3 hari pertama setelah beli, wajar jika harga menguji area breakout atau bergerak di sekitar harga impas (${fmtRp(netBreakevenPrice)}). Fokus utama hanya memastikan auto-SL sudah aktif di sekuritas.`,
+      headline: `Fase awal swing (hari ke-${holdingBars}). Biarkan harga bernapas dengan Hard SL di ${fmtRp(pos.sl_installed ?? suggestedSl)}.`,
+      detail: `Pada 1–3 hari pertama setelah beli, wajar jika harga menguji area breakout. Anda tidak perlu menggeser SL setiap malam—cukup pastikan Hard SL -8% terpasang di sekuritas.`,
       suggestedSl,
     };
   }
 
-  // 13. KONDISI NORMAL: Tahan posisi (Hold)
+  // 14. KONDISI NORMAL: Tahan posisi (Hold)
   return {
     ...base,
     code: "HOLD",
     badge: "TAHAN POSISI (HOLD)",
     badgeCls: "bg-slate-800 text-white",
     borderCls: "border-emerald-200",
-    headline: `Pertahankan posisi & biarkan auto-SL aktif di ${fmtRp(pos.sl_installed ?? suggestedSl ?? stLine)}.`,
-    detail: `Tren masih Bullish sehat (hari ke-${holdingBars}, sisa ${daysToTimeStop} hari menuju evaluasi 20h, jarak ${distAtr.toFixed(1)} ATR di atas garis ST).`,
+    headline: `Pertahankan posisi · Auto-SL aktif di ${fmtRp(pos.sl_installed ?? suggestedSl)}.`,
+    detail: `Tren Bullish sehat (hari ke-${holdingBars}, sisa ${daysToTimeStop} hari menuju evaluasi 20h, garis ST di ${fmtRp(stLine)}).`,
     suggestedSl,
   };
 }
@@ -907,12 +1038,12 @@ export function buildMorningActionText(params: {
 
   const regimeTxt =
     ihsgBullish === true
-      ? "IHSG BULLISH (Porsi 100%)"
+      ? "IHSG BULLISH (Alokasi 100% · Rp 40 Jt/Slot)"
       : ihsgBullish === false
-      ? "IHSG BEARISH (Defensif · Porsi 50%)"
+      ? "IHSG BEARISH (Defensif 50% · Rp 20 Jt/Slot)"
       : "IHSG –";
 
-  lines.push(`=== MORNING ACTION SHEET${dateLabel ? ` (${dateLabel})` : ""} ===`);
+  lines.push(`=== MORNING ACTION SHEET · PATOKAN SKENARIO A + SL-7${dateLabel ? ` (${dateLabel})` : ""} ===`);
   lines.push(`Rezim Pasar: ${regimeTxt}`);
   lines.push("");
 
@@ -943,7 +1074,7 @@ export function buildMorningActionText(params: {
   }
   lines.push("");
 
-  // Prioritas 2: Pasang / Naikkan Auto-SL
+  // Prioritas 2: Pasang Hard SL (-8%) / Aktifkan Breakeven Lock (+0.5% saat profit >= +8%)
   const slUpdates = openAdvices.filter(
     (x) =>
       x.advice &&
@@ -957,31 +1088,39 @@ export function buildMorningActionText(params: {
   );
   lines.push(`2) UPDATE AUTO-SL DI SEKURITAS (${slUpdates.length})`);
   if (slUpdates.length === 0) {
-    lines.push("   - Semua posisi aktif sudah memiliki SL sesuai garis terbaru.");
+    lines.push("   - Semua posisi aktif sudah memiliki Hard SL (-8%) / Breakeven Lock sesuai aturan SL-7.");
   } else {
     for (const item of slUpdates) {
       const clean = item.pos.ticker.replace(/\.JK$/, "");
       const oldSl = item.pos.sl_installed ? `Rp ${fmtInt.format(item.pos.sl_installed)}` : "Belum ada";
       lines.push(
-        `   - ${clean} (${item.pos.lots} Lot): SL ${oldSl} -> Rp ${fmtInt.format(item.advice!.suggestedSl!)}`
+        `   - ${clean} (${item.pos.lots} Lot): SL ${oldSl} -> Rp ${fmtInt.format(item.advice!.suggestedSl!)} (${item.advice!.badge})`
       );
     }
   }
   lines.push("");
+
+  // Pantauan Waspada Hari ke-1 (Info tambahan agar tidak panik jual)
+  const day1Warns = openAdvices.filter((x) => x.advice?.code === "BEARISH_FLIP_WARN");
+  if (day1Warns.length > 0) {
+    lines.push(`   [Info] Waspada Hari ke-1 di bawah ST (TAHAN 1 hari konfirmasi): ${day1Warns.map((x) => x.pos.ticker.replace(/\.JK$/, "")).join(", ")}`);
+    lines.push("");
+  }
 
   // Prioritas 3: Antrean Beli Baru
   const activeCount = openAdvices.filter((x) => x.advice?.code !== "EXIT_STOP").length;
   const freeSlots = Math.max(0, maxPositions - activeCount);
   lines.push(`3) ANTREAN BELI BARU (Slot Tersedia: ${freeSlots} dari ${maxPositions})`);
   if (freeSlots === 0) {
-    lines.push("   - Slot portofolio penuh. Tunggu ada posisi keluar sebelum beli baru.");
+    lines.push("   - Slot portofolio penuh (25/25). Tunggu ada posisi keluar sebelum beli baru.");
   } else if (buyCandidates.length === 0) {
     lines.push("   - Belum ada kandidat Top Pick (Skor >= 86 & SL <= 8%) yang memenuhi syarat.");
   } else {
     for (const c of buyCandidates.slice(0, freeSlots)) {
       const clean = c.ticker.replace(/\.JK$/, "");
+      const hardSl = calcHardSlPrice(c.close);
       lines.push(
-        `   - ${clean} (Skor ${c.score}): Beli Maks Rp ${fmtInt.format(c.maxBuyLimit)} | ${c.lots} Lot (~Rp ${fmtInt.format(c.estimatedCostRp)}) | Auto-SL Rp ${fmtInt.format(c.orderSl)}`
+        `   - ${clean} (Skor ${c.score}): Beli Maks Rp ${fmtInt.format(c.maxBuyLimit)} | ${c.lots} Lot (~Rp ${fmtInt.format(c.estimatedCostRp)}) | Hard SL -8% Rp ${fmtInt.format(hardSl)}`
       );
     }
   }
